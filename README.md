@@ -4,7 +4,7 @@ A production-oriented, Dockerized Python 3.12 service that uses a normal Telegra
 
 ## Architecture
 
-`Telethon event handler -> sender allowlist -> bounded asyncio queue -> download worker -> rclone copyto -> remote verification`. Each message has an atomic JSON state file in `/data/state`; downloads use isolated `/data/downloads/{chat_id}_{message_id}` directories. Per-user directory selections are atomically persisted by Telegram user ID in `/data/state/user_directories.json`. No database or public port is used.
+`Telethon event handler -> sender allowlist -> bounded asyncio queue -> download worker -> rclone copyto -> remote verification`. Each message has an atomic JSON state file in `/data/state`; downloads use isolated `/data/downloads/{chat_id}_{message_id}` directories. Per-user directory selections are atomically persisted in `/data/state/user_directories.json`, and per-user rclone selections in `/data/state/user_remotes.json`. No database or public port is used.
 
 ## Prerequisites
 
@@ -75,7 +75,23 @@ PowerShell:
 docker run --rm -it -v "${PWD}/config/rclone:/config/rclone" rclone/rclone config --config /config/rclone/rclone.conf
 ```
 
-The remote name must match `RCLONE_REMOTE`. Google Drive, OneDrive, Dropbox, S3, B2, WebDAV, and other rclone backends work without provider-specific application code.
+The same `rclone.conf` may contain multiple sections, for example `[gdrive]`, `[mega]`, and `[onedrive]`. Configure the default and Telegram-selectable allowlist:
+
+```env
+DEFAULT_RCLONE_REMOTE=gdrive
+ALLOWED_RCLONE_REMOTES=gdrive,mega,onedrive
+```
+
+`DEFAULT_RCLONE_REMOTE` falls back to the legacy `RCLONE_REMOTE` when omitted. If `ALLOWED_RCLONE_REMOTES` is omitted, only the default is selectable. Matching is case-insensitive, but the spelling from `ALLOWED_RCLONE_REMOTES` is retained in state and paths. At startup the service uses `rclone listremotes` to ensure every allowed name exists in the mounted config; it does not contact the cloud merely to validate names.
+
+Verify the mounted configuration:
+
+```bash
+docker compose -f docker-compose.prod.yml exec telegram-uploader \
+  rclone listremotes --config /config/rclone/rclone.conf
+```
+
+Google Drive, OneDrive, Dropbox, S3, B2, WebDAV, and other rclone backends work without provider-specific application code.
 
 ## Local development
 
@@ -187,13 +203,26 @@ Forward file
 
 Another configured user, such as `GALAXY`, has an independent selection under `UPLOADS/GALAXY/...`; one user's `.dir` command never affects another user. Use `.dir` to show your current directory and `.dir default` or `.dir reset` to restore your own default. Each path segment may contain letters, numbers, spaces, hyphens, and underscores; use `/` between nested folders. Selections survive container and server restarts and are captured when each job is queued, so later changes never alter queued or active jobs.
 
+## Per-user persistent rclone remotes
+
+Use `.remote` to show your current and available storage, `.remotes` to list the allowlist, and `.remote mega` to select another configured remote. Remote and directory selections are independent:
+
+```text
+.remote mega
+.dir Movies
+Forward file
+-> mega:UPLOADS/GOUTHAM/Movies/file.mkv
+```
+
+Each allowed Telegram user has an independent selection. The remote is captured when a job is queued, so switching storage affects only later files; queued and active jobs keep their original destination. Selections survive restarts and redeployments through the mounted `/data/state/user_remotes.json`. A stored selection removed from `ALLOWED_RCLONE_REMOTES` safely falls back to `DEFAULT_RCLONE_REMOTE`.
+
 ## Commands
 
-Type `.status`, `.queue`, `.dir [path|default|reset]`, `.cancel`, `.cancel <message_id>`, `.retry <message_id>`, `.config`, or `.help` in the monitored private group. Chat and sender authorization are applied before command or media processing. `.config` omits secrets.
+Type `.status`, `.queue`, `.dir [path|default|reset]`, `.remote [storage-name]`, `.remotes`, `.cancel`, `.cancel <message_id>`, `.retry <message_id>`, `.config`, or `.help` in the monitored private group. Chat and sender authorization are applied before command or media processing. `.config` omits secrets.
 
 ## Configuration reference
 
-`.env.example` is the authoritative full reference. `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` are ordered lists that define authorization and each user's top-level cloud directory. `DEBUG_TELEGRAM_IDS=false` is the production-safe default and should be enabled only while discovering initial setup identifiers. Important controls also include `RCLONE_BASE_PATH`, `DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional size ceiling, progress interval, rclone retry/checker/transfer parameters, collision policy (`rename`, `overwrite`, `skip`), local cleanup/failed retention, interrupted-job retry, rotating logs, and optional public links. `REMOTE_FOLDER_PATTERN` is deprecated, retained only for environment compatibility, and has no effect; date folders are disabled. `MAX_FILE_SIZE_GB=0` disables the application ceiling.
+`.env.example` is the authoritative full reference. `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` are ordered lists that define authorization and each user's top-level cloud directory. `DEFAULT_RCLONE_REMOTE` defines the fallback storage and `ALLOWED_RCLONE_REMOTES` defines the selectable names. `DEBUG_TELEGRAM_IDS=false` is the production-safe default and should be enabled only while discovering initial setup identifiers. Important controls also include `RCLONE_BASE_PATH`, `DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional size ceiling, progress interval, rclone retry/checker/transfer parameters, collision policy (`rename`, `overwrite`, `skip`), local cleanup/failed retention, interrupted-job retry, rotating logs, and optional public links. `REMOTE_FOLDER_PATTERN` is deprecated, retained only for environment compatibility, and has no effect; date folders are disabled. `MAX_FILE_SIZE_GB=0` disables the application ceiling.
 
 Google Drive uploads use `RCLONE_DRIVE_CHUNK_SIZE=64Mi` by default. The observed peak on a 1 GB deployment remained far below the production container's 700 MiB hard limit, leaving room for this larger upload buffer. Larger chunks can improve resumable-upload throughput but consume that much memory per active transfer. Production Compose reserves 256 MiB and limits the service to 128 processes. Keep `MAX_CONCURRENT_JOBS=1`, `RCLONE_TRANSFERS=1`, and `RCLONE_CHECKERS=2` on a 1 GB instance. Google Drive does not support rclone's multi-thread single-file upload interface, so `RCLONE_TRANSFERS` only helps when separate files are uploading concurrently; it does not split one Drive file across parallel streams. `RCLONE_UPLOAD_TIMEOUT_MINUTES=180` stops a genuinely wedged cloud process; active progress is capped at 99.9% until rclone exits and remote size verification succeeds. When rclone retries, Telegram shows the attempt number, current-attempt progress, and the latest available rclone error instead of holding at the previous attempt's 99.9%. INFO-level rclone diagnostics are inspected for Drive/API failures, and `RCLONE_RETRIES_SLEEP_SECONDS=10` pauses between whole-file attempts.
 
@@ -215,6 +244,16 @@ The container runs as non-root with all Linux capabilities dropped, exposes no p
 
 `config/rclone` is intentionally mounted writable. OAuth remotes such as Google Drive refresh tokens and rclone persists them by creating a temporary file beside `rclone.conf` and atomically replacing the configuration. A read-only mount can make rclone retry an otherwise completed upload and create duplicate objects on providers that allow duplicate names. Restrict the host directory to the service account rather than mounting it read-only.
 
+On Linux, prepare the mounted rclone configuration for container UID/GID `10001:10001`:
+
+```bash
+sudo chown -R 10001:10001 config/rclone
+sudo chmod 700 config/rclone
+sudo chmod 600 config/rclone/rclone.conf
+```
+
+The application never changes these host permissions automatically.
+
 Repository and Docker context rules exclude `.env` variants, Telegram sessions, rclone configuration, downloads, state, logs, image archives, private keys, IDE metadata, and caches. `.env.example` contains placeholders only. Never add production credentials to workflow YAML or Compose files; keep them in GitHub Actions secrets and server-mounted runtime files.
 
 ## Testing and updates
@@ -231,6 +270,7 @@ docker compose up -d
 
 - **Session missing/expired:** rerun the one-shot authentication command.
 - **Remote invalid/quota/permission:** run `rclone about REMOTE: --config config/rclone/rclone.conf` and inspect service logs.
+- **Allowed remote missing at startup:** compare `ALLOWED_RCLONE_REMOTES` with `rclone listremotes --config config/rclone/rclone.conf`; names must exist in the same mounted config.
 - **Rclone config read-only:** make `config/rclone` writable by container UID 10001. OAuth token refresh cannot work on a read-only mount.
 - **Unhealthy container:** inspect `/data/state/health.json`, `docker compose ps`, and logs.
 - **Message ignored:** confirm `WATCH_MODE=chat`, the private `WATCH_CHAT_ID`, and that the sender has a position-matched entry in both allowed-user lists.

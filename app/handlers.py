@@ -144,7 +144,8 @@ def register_handlers(client: object, settings: Settings, queue: QueueManager, s
             filename = sanitize_filename(original or fallback_filename(event.message.id, media_type, timestamp, getattr(file, "mime_type", None)))
             upload_directory = await directories.get_user_current_directory(sender_id)
             upload_username = directories.get_allowed_username(sender_id)
-            job = UploadJob(job_key=key, chat_id=event.chat_id, message_id=event.message.id, sender_id=sender_id, filename=filename, file_size=size, upload_username=upload_username, upload_directory=upload_directory, media_group_id=str(event.message.grouped_id) if event.message.grouped_id else None)
+            selected_remote = await commands.remotes.get_selected_remote(sender_id)
+            job = UploadJob(job_key=key, chat_id=event.chat_id, message_id=event.message.id, sender_id=sender_id, filename=filename, file_size=size, upload_username=upload_username, upload_directory=upload_directory, rclone_remote=selected_remote, media_group_id=str(event.message.grouped_id) if event.message.grouped_id else None)
             if queue.queue.full():
                 await event.reply("Upload queue is full. Please retry later.")
                 return
@@ -153,7 +154,7 @@ def register_handlers(client: object, settings: Settings, queue: QueueManager, s
             # early progress edits are lost.
             position = queue.queue.qsize() + 1
             destination = directories.build_destination_directory(sender_id, upload_directory)
-            status = await event.reply(f"Queued\n\nFile: {filename}\nSize: {format_bytes(size)}\nDirectory: {upload_directory}\nDestination: {destination}\nPosition: {position}")
+            status = await event.reply(f"Queued\n\nFile: {filename}\nSize: {format_bytes(size)}\nStorage: {selected_remote}\nDirectory: {upload_directory}\nDestination: {selected_remote}:{destination}\nPosition: {position}")
             job.status_message_id = status.id
             await state.save(job)
             try:

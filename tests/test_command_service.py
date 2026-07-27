@@ -8,6 +8,7 @@ from app.config import Settings
 from app.directory_service import DirectoryService
 from app.handlers import register_handlers
 from app.queue_manager import QueueManager
+from app.remote_service import RemoteService
 from app.state_store import StateStore
 
 
@@ -52,7 +53,9 @@ async def service(tmp_path):
     config = settings(tmp_path)
     directories = DirectoryService(tmp_path, config.rclone_base_path, config.default_upload_directory, config.allowed_users)
     await directories.load()
-    return CommandService(config, QueueManager(5), StateStore(tmp_path), directories), directories
+    remotes = RemoteService(config)
+    await remotes.load()
+    return CommandService(config, QueueManager(5), StateStore(tmp_path), directories, remotes), directories
 
 
 async def test_dir_show_set_nested_reset_and_user_isolation(tmp_path):
@@ -85,6 +88,44 @@ async def test_dir_rejects_unsafe_name(tmp_path):
     await commands.handle(event)
     assert event.replies == ["Invalid directory name.\nUse letters, numbers, spaces, hyphens, and underscores, with / between nested folders."]
     assert await directories.get_user_current_directory(123) == "DOWNLOADS"
+
+
+async def test_remote_commands_and_per_user_isolation(tmp_path):
+    commands, _ = await service(tmp_path)
+    commands.settings.allowed_rclone_remotes = ["gdrive", "mega"]
+
+    show = Event(".remote", sender_id=123)
+    await commands.handle(show)
+    assert show.replies == [
+        "Current storage: gdrive\nAvailable storage: gdrive, mega\n\nUsage:\n.remote <storage-name>"
+    ]
+
+    select = Event(".remote MEGA", sender_id=123)
+    await commands.handle(select)
+    assert select.replies == ["Storage changed to: mega"]
+    assert await commands.remotes.get_selected_remote(123) == "mega"
+    assert await commands.remotes.get_selected_remote(456) == "gdrive"
+
+    listing = Event(".remotes", sender_id=123)
+    await commands.handle(listing)
+    assert listing.replies == [
+        "Available storage:\n1. gdrive\n2. mega\n\nCurrent storage: mega"
+    ]
+
+    invalid = Event(".remote unknown", sender_id=123)
+    await commands.handle(invalid)
+    assert invalid.replies == [
+        "Unknown storage: unknown\n\nAvailable storage:\ngdrive, mega"
+    ]
+
+
+async def test_status_with_no_active_job_uses_selected_remote(tmp_path):
+    commands, _ = await service(tmp_path)
+    status = Event(".status", sender_id=123)
+    await commands.handle(status)
+    assert "Active: none" in status.replies[0]
+    assert "Storage: gdrive" in status.replies[0]
+    assert "Destination: gdrive:UPLOADS/GOUTHAM/DOWNLOADS" in status.replies[0]
 
 
 async def test_authorization_and_monitored_group_are_enforced(tmp_path):
@@ -171,6 +212,8 @@ async def test_debug_disabled_does_not_fetch_entities(tmp_path):
 
 async def test_concurrent_files_receive_distinct_queue_positions(tmp_path):
     commands, directories = await service(tmp_path)
+    commands.settings.allowed_rclone_remotes = ["gdrive", "mega"]
+    await commands.remotes.set_selected_remote(123, "mega")
     client = FakeClient()
     register_handlers(client, commands.settings, commands.queue, commands.state, commands, directories, self_id=123)
 
@@ -201,3 +244,5 @@ async def test_concurrent_files_receive_distinct_queue_positions(tmp_path):
     await asyncio.gather(*(client.handler(event) for event in events))
 
     assert [event.replies[0].rsplit("Position: ", 1)[1] for event in events] == ["1", "2", "3"]
+    await commands.remotes.set_selected_remote(123, "gdrive")
+    assert [job.rclone_remote for job in commands.queue.snapshot()] == ["mega", "mega", "mega"]

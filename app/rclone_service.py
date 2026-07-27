@@ -51,14 +51,55 @@ class RcloneService:
         stdout, stderr = await process.communicate()
         return process.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
-    async def validate_remote(self) -> None:
-        code, _, err = await self._run("rclone", "about", f"{self.settings.rclone_remote}:", "--config", str(self.settings.rclone_config_path))
+    async def list_configured_remotes(self) -> list[str]:
+        code, out, err = await self._run(
+            "rclone",
+            "listremotes",
+            "--config",
+            str(self.settings.rclone_config_path),
+        )
         if code:
-            raise UploadError(f"Invalid or inaccessible rclone remote: {err.strip()[:300]}")
+            raise UploadError(f"Unable to read rclone remote names: {err.strip()[:300]}")
+        return [line.strip()[:-1] for line in out.splitlines() if line.strip().endswith(":")]
 
-    def build_remote_path(self, filename: str, upload_directory: str) -> str:
+    async def validate_configured_remotes(self) -> None:
+        configured = await self.list_configured_remotes()
+        configured_by_name = {name.casefold(): name for name in configured}
+        missing = [
+            remote
+            for remote in self.settings.allowed_rclone_remotes
+            if remote.casefold() not in configured_by_name
+        ]
+        if missing:
+            raise UploadError(
+                "Configured rclone remote name(s) missing from rclone.conf: "
+                + ", ".join(missing)
+            )
+        # Use the exact section spelling emitted by rclone after performing
+        # case-insensitive matching against Telegram/config input.
+        canonical_allowed = [
+            configured_by_name[remote.casefold()]
+            for remote in self.settings.allowed_rclone_remotes
+        ]
+        default = configured_by_name[
+            (self.settings.default_rclone_remote or self.settings.rclone_remote).casefold()
+        ]
+        self.settings.allowed_rclone_remotes = canonical_allowed
+        self.settings.default_rclone_remote = default
+        self.settings.rclone_remote = default
+        LOG.info("Configured rclone remotes: %s", ", ".join(self.settings.allowed_rclone_remotes))
+
+    async def validate_remote(self) -> None:
+        """Backward-compatible startup validator without cloud connectivity."""
+        await self.validate_configured_remotes()
+
+    def build_remote_path(self, filename: str, upload_directory: str, remote_name: str | None = None) -> str:
+        requested = remote_name or self.settings.default_rclone_remote or self.settings.rclone_remote
+        remote = self.settings.resolve_rclone_remote(requested)
+        if remote is None:
+            raise ValueError(f"rclone remote is not allowed: {requested}")
         relative = PurePosixPath(self.settings.rclone_base_path.strip("/")) / upload_directory / filename
-        return f"{self.settings.rclone_remote}:{relative.as_posix()}"
+        return f"{remote}:{relative.as_posix()}"
 
     async def remote_exists(self, remote_path: str) -> bool:
         code, out, _ = await self._run("rclone", "lsjson", remote_path, "--stat", "--config", str(self.settings.rclone_config_path))
