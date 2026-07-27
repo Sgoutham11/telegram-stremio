@@ -17,6 +17,7 @@ from .logging_config import configure_logging
 from .progress_service import ProgressService
 from .queue_manager import QueueManager
 from .rclone_service import RcloneService
+from .remote_service import RemoteService
 from .state_store import StateStore
 from .telegram_client import create_client
 from .worker import Worker
@@ -43,13 +44,15 @@ async def run() -> None:
     await directories.load()
     queue = QueueManager(settings.queue_max_size)
     rclone = RcloneService(settings)
-    await rclone.validate_remote()
+    await rclone.validate_configured_remotes()
+    remotes = RemoteService(settings)
+    await remotes.load()
     client = create_client(settings)
     await client.connect()
     if not await client.is_user_authorized():
         raise RuntimeError("Telegram session is expired or unauthorized; run: python -m app.auth")
     me = await client.get_me()
-    commands = CommandService(settings, queue, state, directories)
+    commands = CommandService(settings, queue, state, directories, remotes)
     register_handlers(client, settings, queue, state, commands, directories, me.id)
     progress = ProgressService(client, settings.progress_update_interval_seconds)
     worker_objects = [Worker(client, settings, queue, state, FileService(settings), rclone, progress) for _ in range(settings.max_concurrent_jobs)]

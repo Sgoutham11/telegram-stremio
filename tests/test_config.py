@@ -13,6 +13,8 @@ def test_environment_parsing(monkeypatch):
     monkeypatch.setenv("ALLOWED_USER_NAME", "GOUTHAM, GALAXY")
     monkeypatch.setenv("DELETE_LOCAL_AFTER_SUCCESS", "false")
     monkeypatch.setenv("TELEGRAM_DOWNLOAD_CONNECTIONS", "6")
+    monkeypatch.setenv("DEFAULT_RCLONE_REMOTE", " gdrive ")
+    monkeypatch.setenv("ALLOWED_RCLONE_REMOTES", " gdrive, Mega ")
     settings = Settings(_env_file=None)
     assert settings.allowed_user_ids == [1, 2]
     assert settings.allowed_user_names == ["GOUTHAM", "GALAXY"]
@@ -21,6 +23,49 @@ def test_environment_parsing(monkeypatch):
     assert settings.telegram_download_connections == 6
     assert settings.default_upload_directory == "DOWNLOADS"
     assert settings.remote_folder_pattern == ""
+    assert settings.default_rclone_remote == "gdrive"
+    assert settings.allowed_rclone_remotes == ["gdrive", "Mega"]
+    assert settings.resolve_rclone_remote("mega") == "Mega"
+
+
+def test_legacy_rclone_remote_is_default_and_only_allowed_remote(monkeypatch):
+    for key, value in BASE.items(): monkeypatch.setenv(key, value)
+    settings = Settings(
+        _env_file=None,
+        rclone_remote="legacy_drive",
+        default_rclone_remote=None,
+        allowed_rclone_remotes=[],
+    )
+    assert settings.default_rclone_remote == "legacy_drive"
+    assert settings.rclone_remote == "legacy_drive"
+    assert settings.allowed_rclone_remotes == ["legacy_drive"]
+
+
+def test_default_remote_must_be_allowed(monkeypatch):
+    for key, value in BASE.items(): monkeypatch.setenv(key, value)
+    with pytest.raises(ValidationError, match="must be present"):
+        Settings(
+            _env_file=None,
+            default_rclone_remote="gdrive",
+            allowed_rclone_remotes=["mega"],
+        )
+
+
+def test_remote_names_are_case_insensitive_and_duplicates_are_rejected(monkeypatch):
+    for key, value in BASE.items(): monkeypatch.setenv(key, value)
+    settings = Settings(
+        _env_file=None,
+        default_rclone_remote="GDRIVE",
+        allowed_rclone_remotes=["gdrive", "Mega"],
+    )
+    assert settings.default_rclone_remote == "gdrive"
+    assert settings.resolve_rclone_remote("mEgA") == "Mega"
+    with pytest.raises(ValidationError, match="duplicate"):
+        Settings(
+            _env_file=None,
+            default_rclone_remote="gdrive",
+            allowed_rclone_remotes=["gdrive", "GDRIVE"],
+        )
 
 
 def test_chat_mode_requires_id(monkeypatch):

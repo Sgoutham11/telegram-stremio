@@ -22,7 +22,11 @@ class Settings(BaseSettings):
     debug_telegram_ids: bool = False
     allowed_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     allowed_user_names: Annotated[list[str], NoDecode] = Field(default_factory=list, validation_alias="ALLOWED_USER_NAME")
+    # RCLONE_REMOTE is retained for backward compatibility. At validation
+    # time it is normalized to the effective DEFAULT_RCLONE_REMOTE.
     rclone_remote: str = "gdrive"
+    default_rclone_remote: str | None = None
+    allowed_rclone_remotes: Annotated[list[str], NoDecode] = Field(default_factory=list)
     rclone_base_path: str = "UPLOADS"
     default_upload_directory: str = "DOWNLOADS"
     remote_folder_pattern: str = ""  # Deprecated; retained only for env compatibility.
@@ -86,6 +90,15 @@ class Settings(BaseSettings):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
+    @field_validator("allowed_rclone_remotes", mode="before")
+    @classmethod
+    def parse_rclone_remotes(cls, value: object) -> object:
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
     @field_validator("allowed_user_names")
     @classmethod
     def user_names_are_safe(cls, value: list[str]) -> list[str]:
@@ -97,8 +110,21 @@ class Settings(BaseSettings):
     @field_validator("rclone_remote")
     @classmethod
     def remote_name_is_safe(cls, value: str) -> str:
+        value = value.strip()
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
             raise ValueError("RCLONE_REMOTE contains invalid characters")
+        return value
+
+    @field_validator("default_rclone_remote", mode="before")
+    @classmethod
+    def optional_default_remote_is_safe(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if not isinstance(value, str):
+            raise ValueError("DEFAULT_RCLONE_REMOTE must be text")
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError("DEFAULT_RCLONE_REMOTE contains invalid characters")
         return value
 
     @field_validator("default_upload_directory")
@@ -129,6 +155,23 @@ class Settings(BaseSettings):
             raise ValueError("ALLOWED_USER_NAME must not contain duplicate names")
         if self.watch_mode == "chat" and not self.allowed_user_ids and not self.debug_telegram_ids:
             raise ValueError("ALLOWED_USER_IDS and ALLOWED_USER_NAME require at least one entry when WATCH_MODE=chat")
+        default_remote = self.default_rclone_remote or self.rclone_remote
+        allowed_remotes = [remote.strip() for remote in self.allowed_rclone_remotes] or [default_remote]
+        for remote in allowed_remotes:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", remote):
+                raise ValueError(f"ALLOWED_RCLONE_REMOTES contains an invalid remote name: {remote!r}")
+        folded = [remote.casefold() for remote in allowed_remotes]
+        if len(set(folded)) != len(folded):
+            raise ValueError("ALLOWED_RCLONE_REMOTES must not contain duplicate names")
+        canonical_default = next(
+            (remote for remote in allowed_remotes if remote.casefold() == default_remote.casefold()),
+            None,
+        )
+        if canonical_default is None:
+            raise ValueError("DEFAULT_RCLONE_REMOTE must be present in ALLOWED_RCLONE_REMOTES")
+        self.allowed_rclone_remotes = allowed_remotes
+        self.default_rclone_remote = canonical_default
+        self.rclone_remote = canonical_default
         return self
 
     def prepare_directories(self) -> None:
@@ -175,6 +218,10 @@ class Settings(BaseSettings):
             return self.allowed_users[user_id]
         except KeyError as exc:
             raise PermissionError(f"Telegram user {user_id} is not allowed") from exc
+
+    def resolve_rclone_remote(self, remote_name: str) -> str | None:
+        candidate = remote_name.strip().casefold()
+        return next((remote for remote in self.allowed_rclone_remotes if remote.casefold() == candidate), None)
 
     def is_authorized(self, sender_id: int, self_id: int | None = None) -> bool:
         return sender_id in self.allowed_users

@@ -24,6 +24,46 @@ def test_custom_destination(tmp_path):
     assert RcloneService(settings(tmp_path)).build_remote_path("movie.mkv", "goutham") == "gdrive:UPLOADS/goutham/movie.mkv"
 
 
+def test_selected_remote_destination_and_untrusted_remote_rejection(tmp_path):
+    config = settings(tmp_path)
+    config.allowed_rclone_remotes = ["gdrive", "mega"]
+    service = RcloneService(config)
+    assert service.build_remote_path("movie.mkv", "goutham", "MEGA") == "mega:UPLOADS/goutham/movie.mkv"
+    import pytest
+    with pytest.raises(ValueError):
+        service.build_remote_path("movie.mkv", "goutham", "mega;touch")
+
+
+async def test_startup_rejects_allowed_remote_missing_from_config(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    config.allowed_rclone_remotes = ["gdrive", "mega"]
+    service = RcloneService(config)
+
+    async def run(*_args):
+        return 0, "gdrive:\n", ""
+
+    monkeypatch.setattr(service, "_run", run)
+    import pytest
+    with pytest.raises(Exception, match="missing from rclone.conf: mega"):
+        await service.validate_configured_remotes()
+
+
+async def test_startup_remote_validation_does_not_contact_cloud(tmp_path, monkeypatch):
+    config = settings(tmp_path)
+    config.allowed_rclone_remotes = ["gdrive", "Mega"]
+    service = RcloneService(config)
+    calls = []
+
+    async def run(*args):
+        calls.append(args)
+        return 0, "gdrive:\nmega:\n", ""
+
+    monkeypatch.setattr(service, "_run", run)
+    await service.validate_configured_remotes()
+    assert calls == [("rclone", "listremotes", "--config", str(config.rclone_config_path))]
+    assert config.allowed_rclone_remotes == ["gdrive", "mega"]
+
+
 async def test_collision_rename(tmp_path, monkeypatch):
     service = RcloneService(settings(tmp_path))
     async def exists(path): return not path.endswith("_2.mkv")

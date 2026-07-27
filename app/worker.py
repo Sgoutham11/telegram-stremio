@@ -39,20 +39,27 @@ class Worker:
                 await self.state.save(job)
                 if self.settings.delete_partial_on_failure:
                     await self.files.remove_job_directory(job)
-                await self._edit(job, f"Upload cancelled\n\nFile: {job.filename}\nMessage ID: {job.message_id}")
+                await self._edit(job, f"Upload cancelled\n\nFile: {job.filename}\nStorage: {job.rclone_remote or self.settings.default_rclone_remote}\nMessage ID: {job.message_id}")
             except Exception as exc:
                 LOG.exception("Job %s failed", job.job_key)
                 job.status, job.error_message, job.completed_at = JobStatus.FAILED, str(exc)[:500], utcnow()
                 await self.state.save(job)
                 if self.settings.delete_partial_on_failure:
                     await self.files.remove_job_directory(job)
-                await self._edit(job, f"Upload failed\n\nFile: {job.filename}\nReason: {job.error_message}\nLocal file {'deleted' if self.settings.delete_partial_on_failure else 'retained for retry'}.\nMessage ID: {job.message_id}")
+                await self._edit(job, f"Upload failed\n\nFile: {job.filename}\nStorage: {job.rclone_remote or self.settings.default_rclone_remote}\nReason: {job.error_message}\nLocal file {'deleted' if self.settings.delete_partial_on_failure else 'retained for retry'}.\nMessage ID: {job.message_id}")
             finally:
                 self.queue.finish(job)
 
     async def process(self, job: UploadJob) -> None:
         if self.queue.is_cancelled(job.job_key):
             raise JobCancelled("Job cancelled while queued")
+        # Jobs snapshot their per-user selection at admission. Old state files
+        # and snapshots whose remote was later removed fall back safely.
+        job.rclone_remote = (
+            self.settings.resolve_rclone_remote(job.rclone_remote)
+            or self.settings.default_rclone_remote
+            or self.settings.rclone_remote
+        )
         job.started_at, job.status = utcnow(), JobStatus.DOWNLOADING
         path = await self.files.prepare(job)
         await self.state.save(job)
@@ -97,7 +104,7 @@ class Worker:
         if not path.is_file() or path.stat().st_size != job.file_size:
             raise IOError("Downloaded file size does not match Telegram metadata")
         job.status, job.bytes_processed, job.progress_percent = JobStatus.DOWNLOADED, 0, 0
-        job.remote_path = self.rclone.build_remote_path(job.filename, job.remote_directory)
+        job.remote_path = self.rclone.build_remote_path(job.filename, job.remote_directory, job.rclone_remote)
         job.remote_path = await self.rclone.resolve_collision(job.remote_path)
         job.status = JobStatus.UPLOADING
         await self.state.save(job)
@@ -137,12 +144,12 @@ class Worker:
             # Reserve 100% for a successful rclone exit and remote size check.
             job.progress_percent = min(99.9, unique_bytes * 100 / job.file_size) if job.file_size else 0
             if job.file_size and current >= job.file_size:
-                phase = f"Finalizing upload on {self.settings.rclone_remote}\nAttempt: {upload_attempt}"
+                phase = f"Finalizing upload on {job.rclone_remote}\nAttempt: {upload_attempt}"
             elif upload_attempt > 1:
                 reason = f"\nLast error: {retry_reason[:300]}" if retry_reason else ""
-                phase = f"Retrying upload to {self.settings.rclone_remote}\nAttempt: {upload_attempt}{reason}"
+                phase = f"Retrying upload to {job.rclone_remote}\nAttempt: {upload_attempt}{reason}"
             else:
-                phase = f"Uploading to {self.settings.rclone_remote}"
+                phase = f"Uploading to {job.rclone_remote}"
             await self.progress.update(job, phase, force=restarted)
 
         result = await self.rclone.upload_file(job, upload_progress, upload_event)
@@ -150,7 +157,9 @@ class Worker:
         job.completed_at = utcnow()
         await self.state.save(job)
         elapsed = (job.completed_at - job.started_at).total_seconds() if job.started_at else 0
-        await self._edit(job, f"Upload completed\n\nFile: {job.filename}\nSize: {format_bytes(job.file_size)}\nDestination: {result.public_link or result.remote_path}\nTotal time: {format_duration(elapsed)}\nMessage ID: {job.message_id}")
+        remote_relative_path = result.remote_path.split(":", 1)[1] if ":" in result.remote_path else result.remote_path
+        public_link = f"\nLink: {result.public_link}" if result.public_link else ""
+        await self._edit(job, f"Upload completed\n\nFile: {job.filename}\nSize: {format_bytes(job.file_size)}\nStorage: {job.rclone_remote}\nPath: {remote_relative_path}{public_link}\nTotal time: {format_duration(elapsed)}\nMessage ID: {job.message_id}")
         if self.settings.delete_local_after_success:
             await self.files.remove_job_directory(job)
 

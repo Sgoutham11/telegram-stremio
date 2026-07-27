@@ -31,6 +31,7 @@ class UploadJob(BaseModel):
     filename: str
     upload_username: str = ""
     upload_directory: str = "DOWNLOADS"
+    rclone_remote: str = ""
     file_size: int = 0
     media_group_id: str | None = None
     local_path: str | None = None
@@ -64,6 +65,14 @@ class UploadJob(BaseModel):
         value = value.strip()
         if value and (value in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9 _-]{1,100}", value)):
             raise ValueError("invalid upload username")
+        return value
+
+    @field_validator("rclone_remote")
+    @classmethod
+    def rclone_remote_is_safe(cls, value: str) -> str:
+        value = value.strip()
+        if value and not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError("invalid rclone remote")
         return value
 
     @property

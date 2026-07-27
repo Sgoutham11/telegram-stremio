@@ -41,7 +41,7 @@ class StateStore:
         jobs: dict[str, UploadJob] = {}
         self.directory.mkdir(parents=True, exist_ok=True)
         for path in self.directory.glob("*.json"):
-            if path.name in {"health.json", "current_directory.json", "user_directories.json"}:
+            if path.name in {"health.json", "current_directory.json", "user_directories.json", "user_remotes.json"}:
                 continue
             try:
                 job = UploadJob.model_validate_json(path.read_text(encoding="utf-8"))

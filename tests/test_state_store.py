@@ -24,10 +24,12 @@ async def test_old_job_without_upload_directory_defaults_to_downloads(tmp_path):
     loaded = await StateStore(tmp_path).load_all()
     assert loaded["1:2"].upload_directory == "DOWNLOADS"
     assert loaded["1:2"].upload_username == ""
+    assert loaded["1:2"].rclone_remote == ""
     assert loaded["1:2"].remote_directory == "DOWNLOADS"
 
 
 async def test_directory_state_is_not_treated_as_job_state(tmp_path):
     (tmp_path / "current_directory.json").write_text(json.dumps({"directory": "Movies"}))
     (tmp_path / "user_directories.json").write_text(json.dumps({"123": {"username": "GOUTHAM", "current_directory": "Movies"}}))
+    (tmp_path / "user_remotes.json").write_text(json.dumps({"123": {"selected_remote": "mega"}}))
     assert await StateStore(tmp_path).load_all() == {}

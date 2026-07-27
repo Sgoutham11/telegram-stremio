@@ -31,7 +31,8 @@ class ProgressService:
         if lock.locked():
             return
         async with lock:
-            text = f"{phase}\n\nFile: {job.filename}\nProgress: {job.progress_percent:.1f}%\nProcessed: {format_bytes(job.bytes_processed)} / {format_bytes(job.file_size)}\nSpeed: {format_bytes(job.speed_bytes_per_second)}/s\nETA: {format_duration(job.eta_seconds)}"
+            storage = f"\nStorage: {job.rclone_remote}" if job.rclone_remote else ""
+            text = f"{phase}\n\nFile: {job.filename}{storage}\nProgress: {job.progress_percent:.1f}%\nProcessed: {format_bytes(job.bytes_processed)} / {format_bytes(job.file_size)}\nSpeed: {format_bytes(job.speed_bytes_per_second)}/s\nETA: {format_duration(job.eta_seconds)}"
             if text == self._last_text.get(job.job_key):
                 self._last[job.job_key] = time.monotonic()
                 return
