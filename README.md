@@ -293,6 +293,12 @@ that private reply, follows its `reply_to_msg_id` to the owner's original media
 message, and downloads it. No external user is added to a common group and no
 user session can see another user's bot conversation.
 
+Telegram QR tokens are short-lived even though the overall onboarding window
+is longer. While the connection page remains open, the service automatically
+recreates expired Telegram QR tokens and the browser replaces the displayed
+image during its normal status polling. Always scan the currently visible QR;
+an older photograph cannot be accepted after its embedded token expires.
+
 ## Configuration reference
 
 `.env.example` is the authoritative full reference. `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` are ordered lists that define authorization and each user's top-level cloud directory. `DEFAULT_RCLONE_REMOTE` defines the fallback storage and `ALLOWED_RCLONE_REMOTES` defines the selectable names. `DEBUG_TELEGRAM_IDS=false` is the production-safe default and should be enabled only while discovering initial setup identifiers. Important controls also include `RCLONE_BASE_PATH`, `DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional size ceiling, progress interval, rclone retry/checker/transfer parameters, collision policy (`rename`, `overwrite`, `skip`), local cleanup/failed retention, interrupted-job retry, rotating logs, and optional public links. `REMOTE_FOLDER_PATTERN` is deprecated, retained only for environment compatibility, and has no effect; date folders are disabled. `MAX_FILE_SIZE_GB=0` disables the application ceiling.
