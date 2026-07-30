@@ -12,7 +12,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utcnow_text() -> str:
+    return utcnow().isoformat()
+
+
 class JobStatus(StrEnum):
+    RECEIVED = "RECEIVED"
+    FORWARDING = "FORWARDING"
     QUEUED = "QUEUED"
     DOWNLOADING = "DOWNLOADING"
     DOWNLOADED = "DOWNLOADED"
@@ -20,68 +26,90 @@ class JobStatus(StrEnum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
-    RECOVERABLE = "RECOVERABLE"
+
+
+class TelegramLoginStatus(StrEnum):
+    NOT_CONNECTED = "NOT_CONNECTED"
+    QR_LOADING = "QR_LOADING"
+    WAITING_FOR_SCAN = "WAITING_FOR_SCAN"
+    TWO_FACTOR_REQUIRED = "TWO_FACTOR_REQUIRED"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
 
 
 class UploadJob(BaseModel):
-    job_key: str
-    chat_id: int
-    message_id: int
-    sender_id: int
-    filename: str
-    upload_username: str = ""
-    upload_directory: str = "DOWNLOADS"
-    rclone_remote: str = ""
+    id: int | None = None
+    owner_user_id: int
+    bot_chat_id: int
+    bot_message_id: int
+    internal_chat_id: int | None = None
+    internal_message_id: int | None = None
+    source_reference: str | None = None
+    source_message_id: int | None = None
+    status_message_id: int | None = None
+    file_name: str
     file_size: int = 0
-    media_group_id: str | None = None
+    mime_type: str | None = None
+    selected_remote: str
+    selected_root_directory: str
+    selected_directory: str
     local_path: str | None = None
     remote_path: str | None = None
-    status: JobStatus = JobStatus.QUEUED
-    progress_percent: float = 0.0
-    bytes_processed: int = 0
-    speed_bytes_per_second: float = 0.0
-    eta_seconds: float | None = None
+    status: JobStatus = JobStatus.RECEIVED
+    error_code: str | None = None
     error_message: str | None = None
-    created_at: datetime = Field(default_factory=utcnow)
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    status_message_id: int | None = None
+    created_at: str = Field(default_factory=utcnow_text)
+    updated_at: str = Field(default_factory=utcnow_text)
+    started_at: str | None = None
+    completed_at: str | None = None
 
-    @field_validator("upload_directory")
+    @field_validator("file_name")
     @classmethod
-    def upload_directory_is_safe(cls, value: str) -> str:
-        value = value.strip()
+    def file_name_is_safe(cls, value: str) -> str:
+        if not value or Path(value).name != value or "\x00" in value:
+            raise ValueError("invalid file name")
+        return value
+
+    @field_validator("selected_remote")
+    @classmethod
+    def remote_is_safe(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", value.strip()):
+            raise ValueError("invalid rclone remote")
+        return value.strip()
+
+    @field_validator("selected_directory")
+    @classmethod
+    def directory_is_safe(cls, value: str) -> str:
         parts = [part.strip() for part in value.split("/")]
-        if not parts or len(parts) > 10 or len(value) > 500 or any(
-            part in {"", ".", ".."} or not re.fullmatch(r"[A-Za-z0-9 _-]{1,100}", part)
-            for part in parts
+        if (
+            not parts
+            or len(value) > 500
+            or len(parts) > 10
+            or any(
+                part in {"", ".", ".."}
+                or not re.fullmatch(r"[A-Za-z0-9 _-]{1,100}", part)
+                for part in parts
+            )
         ):
             raise ValueError("invalid upload directory")
         return "/".join(parts)
 
-    @field_validator("upload_username")
+    @field_validator("selected_root_directory")
     @classmethod
-    def upload_username_is_safe(cls, value: str) -> str:
-        value = value.strip()
-        if value and (value in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9 _-]{1,100}", value)):
-            raise ValueError("invalid upload username")
-        return value
-
-    @field_validator("rclone_remote")
-    @classmethod
-    def rclone_remote_is_safe(cls, value: str) -> str:
-        value = value.strip()
-        if value and not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
-            raise ValueError("invalid rclone remote")
+    def root_directory_is_safe(cls, value: str) -> str:
+        value = value.strip().upper()
+        if (
+            value in {"", ".", ".."}
+            or not re.fullmatch(r"[A-Z0-9 _-]{1,100}", value)
+        ):
+            raise ValueError("invalid root directory")
         return value
 
     @property
-    def remote_directory(self) -> str:
-        return f"{self.upload_username}/{self.upload_directory}" if self.upload_username else self.upload_directory
-
-    @property
-    def directory(self) -> Path | None:
-        return Path(self.local_path).parent if self.local_path else None
+    def job_key(self) -> str:
+        return str(self.id or f"{self.owner_user_id}:{self.bot_message_id}")
 
 
 class RcloneResult(BaseModel):

@@ -14,10 +14,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY scripts ./scripts
-RUN chmod 0555 scripts/*.sh && mkdir -p /data/downloads /data/state /data/session /data/logs /config/rclone \
-    && chown -R uploader:uploader /app /data
+RUN chmod 0555 scripts/*.sh \
+    && mkdir -p /data/users /data/pending-telegram /data/logs /config/users \
+    && chown -R uploader:uploader /app /data /config/users \
+    && chmod 0700 /data/users /data/pending-telegram /config/users
 USER uploader
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 CMD ["python", "-m", "app.main"]
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD ["/app/scripts/healthcheck.sh"]
-
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD ["curl", "-fsS", "http://127.0.0.1:8080/healthz"]

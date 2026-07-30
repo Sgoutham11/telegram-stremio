@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Connect Uploader</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <h1>Connect Uploader</h1>
+    <p id="notice" class="notice" role="status"></p>
+
+    <section>
+      <h2>Telegram Account</h2>
+      <p id="telegram-status">Not connected</p>
+      <button id="telegram-connect">Connect Telegram</button>
+      <div id="qr-panel" hidden>
+        <p>In Telegram, open Settings → Devices → Link Desktop Device.</p>
+        <img id="qr-image" alt="Telegram login QR code">
+      </div>
+      <form id="two-factor" hidden>
+        <h3>Telegram Two-Step Verification</h3>
+        <p>Your Telegram account requires an additional password.</p>
+        <input id="two-factor-password" type="password"
+               autocomplete="current-password" required>
+        <button type="submit">Continue</button>
+      </form>
+      <div id="telegram-disconnect-actions" hidden>
+        <button id="telegram-disconnect">Disconnect Telegram</button>
+        <button id="telegram-revoke" class="secondary">
+          Disconnect and revoke this app session
+        </button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Cloud Storage</h2>
+      <p id="storage-status">Not connected</p>
+      <button id="storage-connect">Connect Google Drive</button>
+      <button id="storage-disconnect" hidden>Disconnect Google Drive</button>
+    </section>
+
+    <section id="active-panel" hidden>
+      <h2>Uploader</h2>
+      <p class="active">Active</p>
+    </section>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
