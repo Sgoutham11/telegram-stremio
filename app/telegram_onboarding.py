@@ -184,19 +184,47 @@ class TelegramOnboardingManager:
 
     async def _wait_for_qr(self, pending: PendingLogin, qr_login: Any) -> None:
         try:
-            await asyncio.wait_for(
-                qr_login.wait(), timeout=self.settings.qr_login_ttl_seconds
-            )
-            pending.status = TelegramLoginStatus.CONNECTING
-            await self._persist(pending)
-            await self._finalize(pending)
+            while not self._expired(pending):
+                remaining = max(
+                    0.1,
+                    (
+                        datetime.fromisoformat(pending.expires_at)
+                        - datetime.now(timezone.utc)
+                    ).total_seconds(),
+                )
+                try:
+                    await asyncio.wait_for(qr_login.wait(), timeout=remaining)
+                    pending.status = TelegramLoginStatus.CONNECTING
+                    await self._persist(pending)
+                    await self._finalize(pending)
+                    return
+                except (asyncio.TimeoutError, TimeoutError):
+                    if self._expired(pending):
+                        await self._expire(pending)
+                        return
+                    # Telegram QR tokens expire before the overall onboarding
+                    # window. Keep the connection alive and replace the image
+                    # with a newly exported token.
+                    async with pending.lock:
+                        if pending.status != TelegramLoginStatus.WAITING_FOR_SCAN:
+                            return
+                        await qr_login.recreate()
+                        pending.qr_image = self._qr_data_uri(qr_login.url)
+                        pending.message = (
+                            "The QR code refreshed automatically. Scan the "
+                            "currently displayed code."
+                        )
+                        await self._persist(pending)
+                    LOG.info(
+                        "Refreshed Telegram QR token for connection %s",
+                        pending.connection_id,
+                    )
+            await self._expire(pending)
         except SessionPasswordNeededError:
             pending.status = TelegramLoginStatus.TWO_FACTOR_REQUIRED
             pending.expires_at = expires_at(self.settings.telegram_2fa_ttl_seconds)
             pending.message = "Enter your Telegram two-step verification password."
             await self._persist(pending)
-        except (asyncio.TimeoutError, TimeoutError):
-            await self._expire(pending)
         except asyncio.CancelledError:
             raise
         except Exception:
