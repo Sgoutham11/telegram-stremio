@@ -8,7 +8,7 @@ import httpx
 
 from app.oauth_service import GoogleOAuthService
 from app.rclone_service import RcloneService
-from app.security import RateLimiter, expires_at, token_hash
+from app.security import RateLimiter, expires_at, random_token, token_hash
 from app.web import create_web_app
 from conftest import telegram_user
 
@@ -118,3 +118,55 @@ async def test_web_status_uses_live_storage_verification(settings, database):
     assert response.status_code == 200
     assert response.json()["storage"]["connected"] is False
     assert response.json()["active"] is False
+
+
+async def test_prefixed_connect_redirect_and_cookie_stay_under_uploader(
+    settings, database
+):
+    settings.public_base_url = "https://playbuddy.zapto.org/uploader"
+    await database.upsert_user(telegram_user(10), 10)
+    raw_token = random_token()
+    await database.execute(
+        """
+        INSERT INTO onboarding_tokens
+        (token_hash, telegram_user_id, created_at, expires_at, used)
+        VALUES (?, ?, ?, ?, 0)
+        """,
+        (
+            token_hash(raw_token),
+            10,
+            datetime.now(timezone.utc).isoformat(),
+            expires_at(60),
+        ),
+    )
+    app = create_web_app(
+        settings,
+        database,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        RateLimiter(),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="https://playbuddy.zapto.org",
+        follow_redirects=False,
+    ) as client:
+        response = await client.get("/connect", params={"token": raw_token})
+        index = await client.get("/")
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/uploader/"
+    cookie = response.headers["set-cookie"]
+    assert "Path=/uploader/" in cookie
+    assert "Secure" in cookie
+    assert 'href="static/style.css"' in index.text
+    assert 'src="static/app.js"' in index.text
+
+
+def test_public_base_path_supports_root_and_prefixed_deployments(settings):
+    assert settings.public_base_path == ""
+    settings.public_base_url = "https://playbuddy.zapto.org/uploader"
+    assert settings.public_base_path == "/uploader"

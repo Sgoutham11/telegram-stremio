@@ -44,6 +44,9 @@ def create_web_app(
         openapi_url=None,
     )
     static = Path(__file__).parent / "static"
+    public_base_path = settings.public_base_path
+    public_index = f"{public_base_path}/" if public_base_path else "/"
+    cookie_path = public_index
     app.mount("/static", StaticFiles(directory=static), name="static")
 
     @app.middleware("http")
@@ -88,7 +91,7 @@ def create_web_app(
                 expires_at(settings.web_session_ttl_seconds),
             ),
         )
-        response = RedirectResponse("/", status_code=303)
+        response = RedirectResponse(public_index, status_code=303)
         response.set_cookie(
             "uploader_session",
             raw_session,
@@ -96,7 +99,7 @@ def create_web_app(
             httponly=True,
             secure=True,
             samesite="lax",
-            path="/",
+            path=cookie_path,
         )
         return response
 
@@ -216,10 +219,14 @@ def create_web_app(
         except PermissionError:
             raise HTTPException(status_code=403, detail="Invalid OAuth state") from None
         except Exception:
-            return RedirectResponse("/?storage=failed", status_code=303)
+            return RedirectResponse(
+                f"{public_index}?storage=failed", status_code=303
+            )
         if owner != int(user["telegram_user_id"]):
             raise HTTPException(status_code=403, detail="OAuth ownership mismatch")
-        return RedirectResponse("/?storage=connected", status_code=303)
+        return RedirectResponse(
+            f"{public_index}?storage=connected", status_code=303
+        )
 
     @app.post("/api/storage/google/disconnect")
     async def disconnect_google(request: Request) -> dict[str, str]:

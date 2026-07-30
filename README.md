@@ -175,6 +175,30 @@ Configure these GitHub repository settings under **Settings -> Secrets and varia
 
 The workflow deploys only inside `~/telegram-uploader`. It replaces `telegram-uploader.tar` and `docker-compose.prod.yml`, loads the image, recreates the container, waits for it to become healthy, and removes the transferred archive. The server's `.env`, Telegram session, rclone configuration, downloads, state, and logs remain in their existing bind-mounted paths. Restrict the deploy key to this server and repository workflow.
 
+### Sharing an existing HTTPS domain
+
+The onboarding UI can run below a path prefix while another application keeps
+the domain root. For example:
+
+```text
+https://playbuddy.zapto.org/           -> existing application
+https://playbuddy.zapto.org/uploader/  -> Telegram uploader
+```
+
+Set both public URLs with the same prefix:
+
+```env
+PUBLIC_BASE_URL=https://playbuddy.zapto.org/uploader
+GOOGLE_REDIRECT_URI=https://playbuddy.zapto.org/uploader/api/storage/google/callback
+```
+
+Add the locations from `deploy/nginx/uploader-path.conf.example` inside the
+existing HTTPS `server` block. Keep the trailing slash in
+`proxy_pass http://127.0.0.1:8080/;` so Nginx removes `/uploader` before
+forwarding to FastAPI. Register the complete prefixed callback URL in Google
+Cloud Console. Redirects, cookies, frontend assets, and API requests remain
+under `/uploader/`; the existing application continues to own `/`.
+
 For a manual production update when troubleshooting:
 
 ```bash

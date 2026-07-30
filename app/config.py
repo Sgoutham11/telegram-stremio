@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -86,6 +87,25 @@ class Settings(BaseSettings):
             raise ValueError("DEFAULT_RCLONE_REMOTE contains invalid characters")
         return value
 
+    @field_validator("public_base_url")
+    @classmethod
+    def public_url_is_safe(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+            or ".." in parsed.path.split("/")
+        ):
+            raise ValueError("PUBLIC_BASE_URL must be an HTTP(S) origin and path")
+        if parsed.path and not re.fullmatch(
+            r"(?:/[A-Za-z0-9._~-]+)+", parsed.path
+        ):
+            raise ValueError("PUBLIC_BASE_URL contains an invalid path prefix")
+        return value
+
     @field_validator("default_upload_directory")
     @classmethod
     def directory_is_safe(cls, value: str) -> str:
@@ -140,6 +160,12 @@ class Settings(BaseSettings):
 
     def user_rclone_config(self, telegram_user_id: int) -> Path:
         return self.user_rclone_root / str(int(telegram_user_id)) / "rclone.conf"
+
+    @property
+    def public_base_path(self) -> str:
+        """Path prefix exposed by the reverse proxy, or empty at domain root."""
+        path = urlsplit(self.public_base_url).path.rstrip("/")
+        return "" if path in {"", "/"} else path
 
     def public_dict(self) -> dict[str, object]:
         hidden = {
