@@ -1,412 +1,927 @@
-# Telegram Cloud Uploader
+# Telegram Stremio
 
-A production-oriented, Dockerized Python 3.12 service in which users submit
-files privately to a Telegram bot, connect their own Telegram account and
-Google Drive, and upload into isolated per-user destinations. The service uses
-Telethon/MTProto for media transfer and rclone for verified cloud uploads.
+Telegram Stremio is a private, multi-user Telegram-to-Google Drive uploader.
+Each user sends or forwards a file to the bot, connects their own Telegram
+account and Google Drive through a short-lived onboarding page, and receives
+live download and upload progress in the same private bot conversation.
+
+The service is built with Python 3.12, Telethon, FastAPI, SQLite, rclone, and
+Docker. Files are streamed through local disk rather than loaded completely
+into memory.
+
+> **Disclaimer:** This project is intended for transferring files that users
+> own or are authorised to access. It does not bypass Telegram restrictions,
+> DRM, paywalls, or copyright protections. Users are responsible for complying
+> with Telegram's Terms of Service, cloud-storage policies, and applicable
+> copyright laws.
+
+## What the service provides
+
+- Private bot conversations; no shared processing group is required.
+- One isolated Telegram user session per registered user.
+- One isolated rclone configuration and download directory per user.
+- QR or phone-number Telegram login, including optional Telegram 2FA.
+- Multiple Google Drive accounts per user with verified account identities.
+- Persistent per-user Drive, root-directory, and child-directory selections.
+- Fair FIFO scheduling across users with one active job per user.
+- Parallel Telegram downloads with automatic sequential fallback.
+- Live Telegram progress for queueing, downloading, uploading, completion,
+  cancellation, and failure.
+- Upload collision handling and remote size verification.
+- SQLite-backed crash recovery.
+- A private onboarding UI that can run at a domain root or under a shared
+  domain path such as `/uploader`.
+- Docker health checks, non-root execution, resource limits, and GitHub Actions
+  deployment.
 
 ## Architecture
 
-`Telegram bot -> SQLite FIFO queue -> owner Telethon session -> download worker -> user's selected rclone remote -> remote verification`. Each Telegram user has an isolated session, download directory, storage configuration, and persistent destination preferences. The onboarding web service is bound to host loopback and is intended to be exposed through the existing HTTPS reverse proxy.
+```mermaid
+flowchart LR
+    U["Telegram user"] -->|"/start, /connect, files, commands"| B["Control bot"]
+    B --> S["BotService"]
+    S --> DB[("SQLite")]
+    S -->|single-use setup link| W["FastAPI onboarding UI"]
+    W --> T["Telegram QR / phone login"]
+    W --> G["Google OAuth"]
+    T --> M["Per-user Telethon client"]
+    G --> R["Per-user rclone config"]
+    DB --> Q["Fair user-worker dispatcher"]
+    Q --> M
+    M -->|download original private media| D["Per-user local download"]
+    D -->|rclone copyto| GD["Selected Google Drive"]
+    GD -->|remote path and size verification| Q
+    Q -->|edit private status message| B
+```
+
+### Component responsibilities
+
+| Component | Responsibility |
+| --- | --- |
+| `app/main.py` | Starts the database, bot, connected user clients, dispatcher, maintenance task, and FastAPI server. |
+| `app/bot_service.py` | Handles private bot commands, validates file submissions, creates jobs, and sends status messages. |
+| `app/web.py` | Serves the onboarding UI and authenticated Telegram/Google connection endpoints. |
+| `app/telegram_onboarding.py` | Runs temporary QR or phone login sessions and promotes a verified session into the user's private data directory. |
+| `app/oauth_service.py` | Runs Google OAuth, verifies Google account identity, prevents duplicate accounts, and creates rclone remotes. |
+| `app/client_manager.py` | Maintains one authorized Telethon client for each connected Telegram user. |
+| `app/dispatcher.py` | Selects queued jobs fairly, downloads media, uploads it, reports progress, and recovers interrupted work. |
+| `app/rclone_service.py` | Manages per-user remotes, executes uploads, parses progress, handles collisions, and verifies remote files. |
+| `app/database.py` | Provides the serialized SQLite repository, schema migration, queue queries, and token claiming. |
+| `app/maintenance.py` | Expires temporary setup state and restarts transiently unavailable user sessions. |
+
+## End-to-end flow
+
+### 1. Register and connect
+
+1. The user opens a private conversation with the bot and sends `/start`.
+2. The bot creates or updates that user's SQLite record.
+3. The user sends `/connect`.
+4. The bot creates a short-lived, single-use setup token and returns an HTTPS
+   onboarding link.
+5. Opening the link exchanges the token for an HTTP-only web session cookie.
+6. The user connects the same Telegram account using either:
+   - QR login; or
+   - international phone number, Telegram login code, and 2FA password when
+     enabled.
+7. The service confirms that the authenticated Telegram ID matches the user
+   who opened the setup link.
+8. The user authorizes Google Drive. The service verifies the Google identity,
+   creates a private rclone remote, and confirms that the Drive is accessible.
+
+Phone numbers, Telegram login codes, and 2FA passwords are held only for the
+active login flow; they are not stored in SQLite.
+
+### 2. Submit a file
+
+1. The user sends or forwards media privately to the bot.
+2. The bot verifies that the user has:
+   - registered with `/start`;
+   - an active Telegram user session;
+   - a selected and accessible Google Drive;
+   - a file within the optional application size limit.
+3. The bot sanitizes the filename and snapshots the currently selected remote,
+   root directory, and child directory into a durable job.
+4. A private status reply is created with the job ID, destination, and a random
+   source reference.
+
+The destination snapshot means that later `/remote`, `/dirroot`, or `/dir`
+changes affect only future submissions.
+
+### 3. Schedule, download, and upload
+
+1. The dispatcher selects the oldest queued file for each available user.
+2. A user can occupy only one worker, even if that user has several queued
+   files.
+3. The owner's Telethon client finds the bot's reference reply in that user's
+   private bot conversation and follows the reply back to the original media.
+4. Large files use multiple aligned Telegram download lanes. If a lane stalls
+   or parallel transfer fails, all lanes are cancelled and the file restarts
+   with Telethon's sequential downloader.
+5. The completed local file size is compared with Telegram metadata.
+6. rclone uploads the file to the destination captured by the job.
+7. Completion is reported only after the remote object exists and its size
+   matches the source.
+8. The local file is deleted after verified success when
+   `DELETE_LOCAL_AFTER_SUCCESS=true`.
+
+If the service restarts while a job is downloading or uploading, the active
+job is returned to `QUEUED`. The original media must still be available in the
+user's private bot conversation for processing to resume.
+
+## Queue and concurrency model
+
+`MAX_CONCURRENT_USER_WORKERS` is the number of distinct users who may process
+one file each at the same time. A worker covers the complete download-to-upload
+lifecycle.
+
+With two workers:
+
+```text
+User 1: file A, file B
+User 2: file C
+User 3: file D
+```
+
+`file A` and `file C` can run together. `file B` cannot occupy a second worker
+while User 1 is active. User 3 remains queued until a worker is free. Candidate
+users are ordered by the creation time and ID of their oldest queued job.
+
+This provides:
+
+- global submission-time priority;
+- at most one active file per user;
+- parallel work for different users;
+- no queue monopolization by one account.
+
+## Cloud destinations
+
+Every job uploads to:
+
+```text
+<selected-remote>:<root-directory>/<child-directory>/<filename>
+```
+
+The first connected Drive normally uses `gdrive`. Additional Drives use
+`gdrive_02`, `gdrive_03`, and so on.
+
+The default root directory is the user's Telegram first name plus last name,
+converted to uppercase and sanitized. If no usable name exists, the fallback
+is `USER_<telegram-user-id>`.
+
+Example:
+
+```text
+Telegram name: Goutham S
+Selected remote: gdrive_02
+Root: GOUTHAMS
+Directory: DOWNLOADS
+
+Destination:
+gdrive_02:GOUTHAMS/DOWNLOADS/example.mkv
+```
+
+Users can override the destination for future jobs:
+
+```text
+/remote gdrive_02
+/dirroot GOUTHAM
+/dir Series/Season 01
+```
+
+The resulting destination is:
+
+```text
+gdrive_02:GOUTHAM/Series/Season 01/example.mkv
+```
+
+`REMOTE_COLLISION_POLICY` controls an existing destination:
+
+- `rename` creates names such as `example_1.mkv`;
+- `overwrite` keeps the requested destination;
+- `skip` fails the job instead of replacing the file.
+
+## Bot commands
+
+All supported interaction occurs in a private conversation with the bot.
+
+| Command | Description |
+| --- | --- |
+| `/start` | Register or refresh the private user record. |
+| `/connect` | Create a single-use link for connecting or managing Telegram and Google Drive. |
+| `/tutorial` | Send the illustrated setup and playback guide. This also works before registration. |
+| `/status` | Show live Telegram/Drive connection state, destination preferences, and job counts. |
+| `/cancel [job-id]` | Cancel the specified owned job, or the user's oldest active/queued job when no ID is supplied. |
+| `/dirroot` | Show the current cloud root directory. |
+| `/dirroot <name>` | Set a custom uppercase cloud root for future jobs. |
+| `/dirroot default` | Restore the root generated from the Telegram name. |
+| `/dir` | Show the current child directory and complete destination. |
+| `/dir <path>` | Set the child directory for future jobs; `/` may separate up to ten nested segments. |
+| `/remote` | Show the selected remote and available remotes. |
+| `/remote <name>` | Select a connected Drive for future jobs. |
+| `/remotes` | List connected remote names and Google account emails. |
+| `/ls` | List commands available to the requesting user. |
+| `/help` | Show the same permission-aware command list. |
+
+### Administrator commands
+
+Set `ADMIN_TELEGRAM_USER_ID` to one numeric Telegram user ID to enable read-only
+operational reports for that account:
+
+| Command | Description |
+| --- | --- |
+| `/db users` or `/db user` | List users, connection state, destinations, and job totals. |
+| `/db user <user-id>` | Show one user's operational details. |
+| `/db activeworks` | Show queued, downloading, downloaded, and uploading jobs. |
+| `/db stats` | Show user totals and job totals grouped by status. |
+| `/db failed [limit]` | Show recent failed jobs; the default is 10 and the maximum is 50. |
+
+These reports do not expose session paths, OAuth state, onboarding tokens,
+rclone credentials, or Google tokens.
 
 ## Prerequisites
 
-- Docker Engine with Compose v2
-- A Telegram API ID/hash from [my.telegram.org](https://my.telegram.org)
-- Google OAuth client credentials with the Drive API enabled
-- Enough local space for the largest file plus `MIN_FREE_DISK_GB`
+- Docker Engine and Docker Compose v2.
+- A Telegram account for creating the application credentials.
+- A Telegram bot token from
+  [@BotFather](https://core.telegram.org/bots/tutorial).
+- A Telegram API ID and API hash from
+  [my.telegram.org](https://core.telegram.org/api/obtaining_api_id).
+- A Google Cloud project with the Google Drive API enabled.
+- A Google OAuth 2.0 **Web application** client.
+- HTTPS and a reverse proxy for production onboarding.
+- Free local disk space for each active file plus the configured reserve.
 
-## Configure
+The image supports Linux `amd64` and `arm64`.
 
-```bash
-cp .env.example .env
-mkdir -p data/users data/pending-telegram data/logs config/users
+## Credential setup
+
+### Telegram
+
+1. Sign in to [my.telegram.org](https://my.telegram.org).
+2. Open **API development tools** and create an application.
+3. Copy its `api_id` and `api_hash` into `TELEGRAM_API_ID` and
+   `TELEGRAM_API_HASH`.
+4. Message [@BotFather](https://t.me/BotFather), run `/newbot`, and create the
+   control bot.
+5. Put the returned token in `TELEGRAM_BOT_TOKEN`.
+
+Treat the API hash and bot token as secrets. Anyone with the bot token can
+control the bot.
+
+### Google Drive OAuth
+
+1. Create or select a project in Google Cloud Console.
+2. Enable the Google Drive API.
+3. Configure the OAuth consent screen.
+4. If the app remains in testing mode, add every intended Google account as a
+   test user.
+5. Create an OAuth client with application type **Web application**.
+6. Add the exact callback used by this service as an authorized redirect URI.
+7. Copy the client ID and secret into `GOOGLE_CLIENT_ID` and
+   `GOOGLE_CLIENT_SECRET`.
+
+Examples:
+
+```text
+Local:
+http://localhost:8080/api/storage/google/callback
+
+Dedicated production domain:
+https://uploader.example.com/api/storage/google/callback
+
+Shared domain path:
+https://playbuddy.zapto.org/uploader/api/storage/google/callback
 ```
+
+The value registered in Google Cloud must exactly match
+`GOOGLE_REDIRECT_URI`, including scheme, hostname, path, case, and trailing
+slash behavior.
+
+The service requests OpenID identity/email scopes and Google Drive access. It
+uses the verified Google account identity to prevent the same user from adding
+one Google account more than once.
+
+## Local development
+
+### 1. Create the environment file
 
 PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force data/users,data/pending-telegram,data/logs,config/users
 ```
 
-Put the API credentials from my.telegram.org in `.env`, set `WATCH_MODE=chat`, and set `WATCH_CHAT_ID` to the private group's numeric ID (commonly `-100...`). Configure trusted Telegram IDs and their cloud directory names as ordered lists:
-
-```env
-WATCH_MODE=chat
-WATCH_CHAT_ID=-1001234567890
-ALLOWED_USER_IDS=111111111,222222222
-ALLOWED_USER_NAME=GOUTHAM,GALAXY
-```
-
-The lists map by position: `111111111 -> GOUTHAM` and `222222222 -> GALAXY`. They must have equal, non-zero lengths; IDs and names must be unique. Startup fails on an invalid mapping. Messages from other chats are silently ignored; unknown users in the watched group are directed to `@sgoutham11`, but their content is not processed. Obtain IDs from trusted tooling or Telegram logs; never give an untrusted bot sensitive forwarded content.
-
-### Discover Telegram IDs during setup
-
-If the private group ID or user IDs are not yet known, temporarily enable ID debugging. Debug mode permits startup without `WATCH_CHAT_ID` or an allowlist. While either is missing, discovery-only mode disables new uploads and interrupted-job recovery; only identifier logging remains active.
-
-```env
-WATCH_MODE=chat
-WATCH_CHAT_ID=
-DEBUG_TELEGRAM_IDS=true
-ALLOWED_USER_IDS=
-ALLOWED_USER_NAME=
-```
-
-Start the service and send one message in the desired private group:
-
-```bash
-docker compose -f docker-compose.prod.yml up -d --force-recreate
-docker compose -f docker-compose.prod.yml logs -f telegram-uploader
-```
-
-The log block reports the chat ID for `WATCH_CHAT_ID`, sender ID for `ALLOWED_USER_IDS`, sender display name, username, chat type, and message type. After collecting every trusted user's ID, configure the two ordered allowlist variables, set `DEBUG_TELEGRAM_IDS=false`, and restart. Debugging logs setup metadata and message text from every received Telegram message before filtering; keep it disabled outside this short setup window.
-
-Messages from users who are not listed in `ALLOWED_USER_IDS` are not processed. In the watched group, the service tells them to DM `@sgoutham11`. The service never sends this notice in unrelated chats or while Telegram ID discovery-only mode is active.
-
-## Configure Google Drive storage
-
-Set the Google OAuth client credentials and callback URL in `.env`. Users add
-their own Google Drives from the private `/connect` setup page; the service
-creates and maintains a separate rclone configuration for every Telegram user.
-
-```env
-GOOGLE_CLIENT_ID=your-client-id
-GOOGLE_CLIENT_SECRET=your-client-secret
-GOOGLE_REDIRECT_URI=https://playbuddy.zapto.org/uploader/api/storage/google/callback
-DEFAULT_RCLONE_REMOTE=gdrive
-MULTY_RCLONE_COUNT=2
-```
-
-`MULTY_RCLONE_COUNT` is the maximum number of Google Drive connections each
-Telegram user may add. It defaults to `2` and accepts values from `1` through
-`10`. Every slot must use a different verified Google account. The Google
-account chooser is shown for every new connection, and the server rejects an
-account already connected by that Telegram user.
-
-The first Drive is named `gdrive`, the second `gdrive_02`, then `gdrive_03`,
-and so on. A newly connected Drive becomes the selected destination. Tokens
-and rclone configuration remain private under
-`/config/users/<telegram-user-id>/rclone.conf`.
-
-Connections created by an older application version are upgraded
-automatically: the service reads the authenticated user's ID and email from
-Google Drive before opening the next account chooser. The existing Drive does
-not need to be disconnected.
-
-## Local development
-
-The default [docker-compose.yml](docker-compose.yml) builds the current checkout and is intended for local development:
+Linux, macOS, or WSL:
 
 ```bash
 cp .env.example .env
-docker compose run --rm telegram-uploader python -m app.auth
-docker compose up --build
+```
+
+For local development, override the server-oriented URLs in `.env`:
+
+```env
+PUBLIC_BASE_URL=http://localhost:8080
+GOOGLE_REDIRECT_URI=http://localhost:8080/api/storage/google/callback
+```
+
+Add the same localhost callback to the Google OAuth client, then fill in the
+Telegram and Google credentials.
+
+### 2. Build and start
+
+```bash
+docker compose build --no-cache
+docker compose up -d
 docker compose logs -f telegram-uploader
 ```
 
-Authentication requests the Telegram code and, if enabled, the 2FA password. Normal startup is non-interactive and fails with instructions if `/data/session/telegram.session` is absent. On bind-mounted Linux folders, ensure UID 10001 can write to `data/`.
+The Compose file publishes the UI on `127.0.0.1:8080`, so open:
 
-## Prebuilt Docker image
+```text
+http://localhost:8080
+```
 
-Users who do not want to build the image can download a prebuilt archive from the repository's **Releases** page. Choose `telegram-uploader-linux-amd64.tar.gz` for normal Intel/AMD servers or `telegram-uploader-linux-arm64.tar.gz` for ARM64 servers such as Oracle Ampere. Check a Linux server with `uname -m`: `x86_64` means `amd64`, while `aarch64` or `arm64` means `arm64`.
+### 3. Connect the first user
 
-Download the matching image plus `docker-compose.prod.yml` and `env.example` from one release, then run:
+1. Open the bot privately.
+2. Send `/start`.
+3. Send `/connect`.
+4. Open the returned URL on the same computer. Telegram does not make
+   `localhost` URLs clickable, so copy and paste it into the browser.
+5. Connect the same Telegram account using QR or phone login.
+6. Connect Google Drive.
+7. Send `/status` and confirm both connections.
+8. Send or forward an authorized test file.
+
+On one mobile device, phone login is easier than photographing a QR code and
+scanning it from the same device.
+
+## Production deployment
+
+Production uses `docker-compose.prod.yml`, which expects an existing image
+named `telegram-uploader:latest`. It applies:
+
+- a 700 MiB memory limit;
+- a 256 MiB memory reservation;
+- a PID limit of 128;
+- loopback-only web publishing;
+- all Linux capabilities dropped;
+- `no-new-privileges`;
+- a 90-second graceful stop window;
+- an HTTP health check.
+
+### Required server directory
+
+The included GitHub Actions workflow deploys to:
+
+```text
+~/telegram-uploader
+```
+
+Prepare it once:
 
 ```bash
-mkdir -p ~/telegram-uploader/{data/users,data/pending-telegram,data/logs,config/users}
+mkdir -p ~/telegram-uploader/data/users
+mkdir -p ~/telegram-uploader/data/pending-telegram
+mkdir -p ~/telegram-uploader/data/logs
+mkdir -p ~/telegram-uploader/config/users
 cd ~/telegram-uploader
-mv env.example .env
-# Edit .env before continuing.
-docker load -i telegram-uploader-linux-amd64.tar.gz  # Use the arm64 file on ARM64.
 ```
 
-A first-time installation starts the service and then completes each user's
-Telegram and Google Drive connection through `/connect`:
+Create `.env` directly on the server. Do not commit or copy an existing local
+user database, Telegram session, or rclone configuration if production users
+will connect from the beginning.
+
+On Linux, the container runs as UID/GID `10001:10001`:
 
 ```bash
-docker compose -f docker-compose.prod.yml up -d
-docker compose -f docker-compose.prod.yml logs -f telegram-uploader
+sudo chown -R 10001:10001 data config/users
+sudo chmod 700 data/users data/pending-telegram config/users
 ```
 
-For an update, preserve `.env`, `data/`, and `config/users/`; download and load the new image archive, replace `docker-compose.prod.yml`, and run `docker compose -f docker-compose.prod.yml up -d --force-recreate`.
+### Use an existing HTTPS domain under `/uploader`
 
-To generate the standard Docker archive locally:
-
-```bash
-docker build --pull -t telegram-uploader:latest .
-docker save --output telegram-uploader.tar telegram-uploader:latest
-# Optional on Linux, WSL, or Git Bash:
-gzip -9 telegram-uploader.tar
-```
-
-Both `.tar` and `.tar.gz` are valid inputs to `docker load`; `.tar.gz` is preferred for downloading because it is smaller. Do not commit either archive to normal Git history. To publish downloadable images, open **Actions -> Publish Prebuilt Docker Images -> Run workflow**, enter a version such as `v1.0.0`, and run it. The workflow builds both supported architectures and attaches the compressed images, production Compose file, environment template, and checksums to a GitHub Release.
-
-## Production deployment with GitHub Actions
-
-Production uses [docker-compose.prod.yml](docker-compose.prod.yml). Commits to `main` that change application or deployment files run the tests, build `telegram-uploader:latest` on the GitHub runner, copy the saved image and production Compose file to Oracle, and recreate the service over SSH. The workflow can also be started manually from the GitHub Actions page.
-
-Prepare the Oracle server once:
-
-```bash
-mkdir -p ~/telegram-uploader/{data/users,data/pending-telegram,data/logs,config/users}
-cd ~/telegram-uploader
-# Create the private runtime files once. GitHub Actions does not replace them:
-cp .env.example .env
-# Users create their Telegram and Drive connections through /connect.
-```
-
-The server only needs the production Compose file and these persistent private assets:
-
-- `.env`
-- `data/app.db`
-- per-user Telegram sessions and downloads under `data/users/`
-- per-user rclone configurations under `config/users/`
-- the mounted `data/` directories for pending logins and logs
-
-Configure these GitHub repository settings under **Settings -> Secrets and variables -> Actions**:
-
-- Secret `SERVER_HOST`: Oracle hostname or IP address
-- Secret `SSH_PRIVATE_KEY`: private key text used to connect to Oracle
-- Variable `SERVER_USER`: Oracle SSH user, such as `ubuntu`
-
-The workflow deploys only inside `~/telegram-uploader`. It replaces `telegram-uploader.tar` and `docker-compose.prod.yml`, loads the image, recreates the container, waits for it to become healthy, and removes the transferred archive. The server's `.env`, SQLite database, per-user Telegram sessions, per-user rclone configurations, downloads, and logs remain in their bind-mounted paths. Restrict the deploy key to this server and repository workflow.
-
-### Sharing an existing HTTPS domain
-
-The onboarding UI can run below a path prefix while another application keeps
-the domain root. For example:
+This layout keeps an existing application at the domain root:
 
 ```text
 https://playbuddy.zapto.org/           -> existing application
-https://playbuddy.zapto.org/uploader/  -> Telegram uploader
+https://playbuddy.zapto.org/uploader/  -> Telegram Stremio onboarding
 ```
 
-Set both public URLs with the same prefix:
+Set:
 
 ```env
 PUBLIC_BASE_URL=https://playbuddy.zapto.org/uploader
 GOOGLE_REDIRECT_URI=https://playbuddy.zapto.org/uploader/api/storage/google/callback
 ```
 
-Add the locations from `deploy/nginx/uploader-path.conf.example` inside the
-existing HTTPS `server` block. Keep the trailing slash in
-`proxy_pass http://127.0.0.1:8080/;` so Nginx removes `/uploader` before
-forwarding to FastAPI. Register the complete prefixed callback URL in Google
-Cloud Console. Redirects, cookies, frontend assets, and API requests remain
-under `/uploader/`; the existing application continues to own `/`.
+Add the contents of
+[`deploy/nginx/uploader-path.conf.example`](deploy/nginx/uploader-path.conf.example)
+inside the existing HTTPS `server` block:
 
-For a manual production update when troubleshooting:
+```nginx
+location = /uploader {
+    return 301 /uploader/;
+}
+
+location /uploader/ {
+    proxy_pass http://127.0.0.1:8080/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Prefix /uploader;
+    proxy_read_timeout 60s;
+}
+```
+
+The trailing slash in `proxy_pass http://127.0.0.1:8080/;` is required. It
+removes `/uploader/` before forwarding the request to FastAPI.
+
+Validate and reload Nginx:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Register the complete prefixed callback in Google Cloud. If the callback still
+opens the application at `/`, Nginx is missing this path-specific location or
+the location is outside the active HTTPS server block.
+
+### Use a dedicated domain
+
+For a dedicated hostname, set root URLs:
+
+```env
+PUBLIC_BASE_URL=https://uploader.example.com
+GOOGLE_REDIRECT_URI=https://uploader.example.com/api/storage/google/callback
+```
+
+Use [`deploy/nginx/telegram-stremio.conf`](deploy/nginx/telegram-stremio.conf)
+as a starting point, replace the example hostname and certificate paths, then
+enable the Nginx site.
+
+### Why Compose publishes `127.0.0.1:8080`
+
+The binding:
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
+
+makes the onboarding server reachable from Nginx on the same host but not
+directly exposed to the public internet on port 8080. HTTPS, the public
+hostname, and internet-facing access remain Nginx's responsibility.
+
+## GitHub Actions deployment
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) performs:
+
+1. checkout;
+2. Python dependency installation;
+3. source compilation;
+4. the full pytest suite;
+5. a production Docker build;
+6. `docker save`;
+7. SCP of the image archive and `docker-compose.prod.yml`;
+8. `docker load` on the server;
+9. container recreation;
+10. health-check verification;
+11. temporary archive and unused-image cleanup.
+
+Configure these repository settings under
+**Settings -> Secrets and variables -> Actions**:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| Secret | `SERVER_HOST` | Oracle/server hostname or IP address. |
+| Secret | `SSH_PRIVATE_KEY` | Private SSH key used by the workflow. |
+| Variable | `SERVER_USER` | SSH user, for example `ubuntu`. |
+
+The workflow does not replace the server's `.env`, `data/`, or `config/users/`.
+
+For a manual deployment:
 
 ```bash
 cd ~/telegram-uploader
-# Copy telegram-uploader.tar and docker-compose.prod.yml into this directory first.
 docker load -i telegram-uploader.tar
 docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphans
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml logs --tail=100 telegram-uploader
 ```
 
-## Per-user root and upload directories
+## Prebuilt release images
 
-Every user has an independent root and child directory. The default root is
-their Telegram first name plus last name, converted to uppercase and sanitised.
-The default child directory remains `DOWNLOADS`.
+The manual **Publish Prebuilt Docker Images** workflow creates GitHub Release
+assets for:
 
-```text
-Telegram name: Goutham S
-Forward file
--> GOUTHAMS/DOWNLOADS/file.mkv
+- `telegram-uploader-linux-amd64.tar.gz`;
+- `telegram-uploader-linux-arm64.tar.gz`;
+- `docker-compose.prod.yml`;
+- `env.example`;
+- `SHA256SUMS`.
+
+Check the server architecture:
+
+```bash
+uname -m
 ```
 
-Use `/dirroot` privately with the bot to show or override the root:
+- `x86_64` uses `amd64`;
+- `aarch64` or `arm64` uses `arm64`.
 
-```text
-/dirroot GOUTHAM
-/dir Movies
-Forward file
--> GOUTHAM/Movies/file.mkv
+Install a release:
+
+```bash
+mkdir -p ~/telegram-uploader/{data/users,data/pending-telegram,data/logs,config/users}
+cd ~/telegram-uploader
+mv env.example .env
+# Edit .env and verify SHA256SUMS before continuing.
+docker load -i telegram-uploader-linux-amd64.tar.gz
+docker compose -f docker-compose.prod.yml up -d
 ```
 
-Use `/dirroot default` to return to the sanitised Telegram-name root. Both
-preferences persist in SQLite and are captured when a job is accepted, so
-later changes affect only future jobs. `RCLONE_BASE_PATH` is retained as a
-deprecated environment compatibility setting and is not used for new jobs.
+To create an image archive yourself:
 
-### Legacy directory behavior
-
-With `RCLONE_BASE_PATH=UPLOADS`, `DEFAULT_UPLOAD_DIRECTORY=DOWNLOADS`, and the mapping `111111111 -> GOUTHAM`, that user initially uploads to:
-
-```text
-Forward file
-→ UPLOADS/GOUTHAM/DOWNLOADS/file.mkv
+```bash
+docker build --pull -t telegram-uploader:latest .
+docker save -o telegram-uploader.tar telegram-uploader:latest
+gzip -9 telegram-uploader.tar
 ```
 
-That user can select a nested directory for subsequently forwarded files:
-
-```text
-/dir Series/Friends
-Forward file
-→ UPLOADS/GOUTHAM/Series/Friends/file.mkv
-```
-
-Another configured user, such as `GALAXY`, has an independent selection under `UPLOADS/GALAXY/...`; one user's `/dir` command never affects another user. Use `/dir` to show your current directory and `/dir default` or `/dir reset` to restore your own default. Each path segment may contain letters, numbers, spaces, hyphens, and underscores; use `/` between nested folders. Selections survive container and server restarts and are captured when each job is queued, so later changes never alter queued or active jobs.
-
-## Per-user persistent rclone remotes
-
-Use `/remotes` to list connected Drives and their Google account emails,
-`/remote` to show the current destination, and `/remote gdrive_02` to select a
-different Drive:
-
-```text
-/remotes
-/remote gdrive_02
-/dir Movies
-Forward file
--> gdrive_02:GOUTHAM/Movies/file.mkv
-```
-
-Each user has an independent set of connections and an independent selection.
-The selected remote is captured when a job is queued, so switching storage
-affects only future files; queued and active jobs keep their original
-destination. Connections and selections survive restarts through the mounted
-SQLite database and per-user rclone configuration. The setup page disconnects
-only the currently selected Drive and automatically selects another connected
-Drive when available.
-
-## Commands
-
-All interaction occurs privately with the bot. Use `/start`, `/connect`,
-`/tutorial`, `/status`, `/cancel [job-id]`, `/help`, `/ls`,
-`/dirroot [name|default]`, `/dir [path]`, `/remote [name]`, and `/remotes`.
-`/tutorial` sends a compact illustrated setup and playback guide for
-iPhone/iPad, Android, and Android TV. `/ls` lists only the commands available
-to the requesting user.
-
-Set `ADMIN_TELEGRAM_USER_ID` to the administrator's numeric Telegram user ID
-to enable read-only operational commands for that account:
-
-- `/db user` (or `/db users`) — all users, connection state, destinations,
-  and job totals
-- `/db user <user-id>` — one user's operational details
-- `/db activeworks` — all queued, downloading, and uploading jobs
-- `/db stats` — aggregate user and job counts
-- `/db failed [limit]` — recent failures (1–50, default 10)
-
-These commands never display Telegram session paths, web/onboarding/OAuth
-tokens, or rclone credentials. Leaving `ADMIN_TELEGRAM_USER_ID` blank disables
-the admin command set.
-
-New jobs do not use a shared processing group. The bot replies directly to the
-submitted media with a random job reference. The owner's Telethon session finds
-that private reply, follows its `reply_to_msg_id` to the owner's original media
-message, and downloads it. No external user is added to a common group and no
-user session can see another user's bot conversation.
-
-The `/connect` page lets the user choose either QR login or phone-number login.
-Phone login accepts an international number such as `+919876543210`, sends a
-Telegram login code, and then requests the Telegram two-step-verification
-password when that account has one. The service never writes the phone number,
-login code, or password to SQLite.
-
-Telegram QR tokens are short-lived even though the overall onboarding window
-is longer. While the connection page remains open, the service automatically
-recreates expired QR tokens and replaces the displayed image. Always scan the
-currently visible QR; an older photograph cannot be accepted after its
-embedded token expires. On a single mobile device, use the phone-number option
-instead.
+Do not commit Docker image archives to normal Git history.
 
 ## Configuration reference
 
-`.env.example` is the authoritative full reference.
-`DEFAULT_RCLONE_REMOTE` defines the base name for automatically created Drive
-remotes, while `MULTY_RCLONE_COUNT` limits how many different Google accounts
-each Telegram user can connect. Important controls also include
-`DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional
-size ceiling, progress interval, rclone retry/checker/transfer parameters,
-collision policy (`rename`, `overwrite`, `skip`), rotating logs, and local
-cleanup after successful uploads.
+`.env.example` contains the deployable template. Settings are case-insensitive.
 
-`PHONE_LOGIN_TTL_SECONDS=300` controls how long a phone-code login remains
-open, and `MAX_TELEGRAM_CODE_ATTEMPTS=5` limits incorrect code submissions.
-`TELEGRAM_2FA_TTL_SECONDS` and `MAX_TELEGRAM_2FA_ATTEMPTS` independently
-control the optional two-step-verification stage. `MAX_PENDING_QR_LOGINS`
-remains the compatibility name for the global number of simultaneous
-Telegram onboarding flows; it limits both QR and phone logins.
+### Required credentials and public URLs
 
-`MAX_CONCURRENT_USER_WORKERS=2` allows two distinct users to process one file
-each in parallel, from Telegram download through cloud upload. A single user
-can occupy only one worker. The dispatcher selects the oldest queued file for
-each available user and orders candidates by creation time and job ID. Work
-from a third user remains queued until a worker is free, and the Telegram
-status explains that the workers are busy. This preserves submission-time
-priority: earlier user work is selected before later work, including when the
-same user submits another group of files later.
+| Variable | Purpose |
+| --- | --- |
+| `TELEGRAM_API_ID` | Numeric Telegram application ID. |
+| `TELEGRAM_API_HASH` | Telegram application secret. |
+| `TELEGRAM_BOT_TOKEN` | Control bot token from BotFather. |
+| `GOOGLE_CLIENT_ID` | Google OAuth Web application client ID. |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret. |
+| `PUBLIC_BASE_URL` | Public onboarding origin and optional path prefix, without a trailing slash. |
+| `GOOGLE_REDIRECT_URI` | Exact Google OAuth callback registered in Google Cloud. |
 
-Google Drive uploads use `RCLONE_DRIVE_CHUNK_SIZE=64Mi` by default. Each active
-worker may run one rclone upload, so memory and network usage increase with
-`MAX_CONCURRENT_USER_WORKERS`. On a 1 GB server, begin with `2` and monitor
-container memory and I/O before increasing it. `RCLONE_UPLOAD_TIMEOUT_MINUTES`
-stops a genuinely wedged cloud process; progress remains below completion
-until rclone exits and remote verification succeeds.
+### Persistent paths
 
-If a host repeatedly sends the complete file but loses Google Drive's final response, use `RCLONE_RETRIES=1` and `RCLONE_LOW_LEVEL_RETRIES=1`. The service checks the expected remote path and size up to six times over 30 seconds after a non-zero rclone exit. A committed object is treated as successful; a missing or wrong-sized object remains failed and retained locally for `.retry`.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_PATH` | `/data/app.db` | SQLite database. |
+| `USER_DATA_ROOT` | `/data/users` | Per-user Telegram sessions and downloads. |
+| `PENDING_TELEGRAM_ROOT` | `/data/pending-telegram` | Temporary onboarding sessions. |
+| `USER_RCLONE_ROOT` | `/config/users` | Per-user rclone configurations. |
+| `BOT_SESSION_PATH` | `/data/bot.session` | Telethon session for the control bot. |
 
-## Large files, recovery, and cleanup
+### Onboarding and web sessions
 
-Files are never loaded wholly into memory. Telethon writes incrementally; rclone handles cloud-side retry/resumability according to the backend. A job begins only when free space covers its Telegram size plus the configured reserve. On restart, active JSON states become recoverable and are queued when `RETRY_INTERRUPTED_JOBS=true`; source messages must still exist. Successful local files are removed only after rclone exit and remote size verification. Failed files remain for `FAILED_FILE_RETENTION_HOURS` unless immediate partial deletion is enabled.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WEB_HOST` | `0.0.0.0` | Address used inside the container. |
+| `WEB_PORT` | `8080` | FastAPI/Uvicorn port. |
+| `QR_LOGIN_TTL_SECONDS` | `120` | Overall QR onboarding lifetime. |
+| `PHONE_LOGIN_TTL_SECONDS` | `300` | Phone-code login lifetime. |
+| `MAX_TELEGRAM_CODE_ATTEMPTS` | `5` | Maximum incorrect phone-code submissions. |
+| `TELEGRAM_2FA_TTL_SECONDS` | `300` | Telegram 2FA stage lifetime. |
+| `MAX_TELEGRAM_2FA_ATTEMPTS` | `5` | Maximum incorrect 2FA submissions. |
+| `WEB_SESSION_TTL_SECONDS` | `1800` | Onboarding browser-session lifetime. |
+| `ONBOARDING_TOKEN_TTL_SECONDS` | `600` | `/connect` single-use link lifetime. |
+| `OAUTH_STATE_TTL_SECONDS` | `600` | Google OAuth state lifetime. |
+| `MAX_PENDING_QR_LOGINS` | `10` | Global limit for simultaneous QR and phone onboarding flows; the name is retained for compatibility. |
 
-The image includes `cryptg`, Telethon's native MTProto encryption accelerator. Actual download speed still depends on the route to the Telegram media data center; repeated connection resets or refused connections in the logs indicate a network/DC-path bottleneck rather than an application rate limit.
+### Storage
 
-Large Telegram files use four parallel aligned download lanes by default (`TELEGRAM_DOWNLOAD_CONNECTIONS=4`) once they reach `PARALLEL_DOWNLOAD_MIN_SIZE_MB=64`. Each lane has a 120-second inactivity watchdog (`TELEGRAM_DOWNLOAD_STALL_TIMEOUT_SECONDS=120`). If a lane stops returning data, all parallel lanes are cancelled before the file is restarted with Telethon's sequential downloader. Set the connection count to `1` to always use the sequential downloader. More connections are not always faster and may worsen an unstable media-DC route; increase gradually and do not exceed the validated maximum of 16.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEFAULT_RCLONE_REMOTE` | `gdrive` | Base name for automatically created remotes. |
+| `MULTY_RCLONE_COUNT` | `2` | Maximum different Google accounts per Telegram user. |
+| `DEFAULT_UPLOAD_DIRECTORY` | `DOWNLOADS` | Default child directory. |
+| `REMOTE_COLLISION_POLICY` | `rename` | `rename`, `overwrite`, or `skip`. |
+| `RCLONE_DRIVE_CHUNK_SIZE` | `64Mi` | Google Drive upload chunk size; larger values increase memory use per active upload. |
+| `RCLONE_RETRIES` | `5` | High-level rclone retry count. |
+| `RCLONE_LOW_LEVEL_RETRIES` | `10` | Low-level API retry count. |
+| `RCLONE_RETRIES_SLEEP_SECONDS` | `10` | Delay between high-level attempts. |
+| `RCLONE_STATS_INTERVAL_SECONDS` | `2` | rclone progress-event interval. |
+| `RCLONE_UPLOAD_TIMEOUT_MINUTES` | `180` | Maximum duration of one rclone process. |
+| `RCLONE_TRANSFERS` | `1` | rclone transfer concurrency inside each active job. |
+| `RCLONE_CHECKERS` | `2` | rclone checker concurrency inside each active job. |
 
-Downloaded files are deleted after verified uploads when `DELETE_LOCAL_AFTER_SUCCESS=true`, and rclone's process memory is returned automatically when it exits. Docker's `NET I/O` and `BLOCK I/O` values are lifetime counters, not retained buffers; resetting them would require recreating the container and would not free RAM or disk space. Do not run host-wide Linux cache-dropping commands after jobs because they affect every service and generally reduce performance.
+`RCLONE_BASE_PATH` is accepted as a deprecated compatibility input but is not
+used when creating new destinations. New jobs use
+`<root-directory>/<child-directory>`.
 
-## Security
+### Workers, downloads, and disk
 
-The container runs as non-root with all Linux capabilities dropped, binds its
-web port only to host loopback, uses subprocess argument arrays (never a
-shell), and sanitizes filenames. Never commit `.env`, SQLite data, sessions,
-downloads, logs, or rclone configuration. Telegram sessions and Google OAuth
-tokens grant account access: restrict their filesystem permissions, back them
-up encrypted, and revoke exposed credentials immediately.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MAX_CONNECTED_USERS` | `100` | Maximum simultaneously connected per-user Telethon clients. |
+| `MAX_CONCURRENT_USER_WORKERS` | `2` | Maximum distinct users processing one file each. |
+| `QUEUE_POLL_INTERVAL_SECONDS` | `1` | Dispatcher polling interval. |
+| `PROGRESS_UPDATE_INTERVAL_SECONDS` | `5` | Minimum delay between Telegram status edits. |
+| `TELEGRAM_DOWNLOAD_CONNECTIONS` | `4` | Parallel lanes for sufficiently large Telegram files. Set `1` for sequential downloads. |
+| `PARALLEL_DOWNLOAD_MIN_SIZE_MB` | `64` | Minimum file size that enables parallel download. |
+| `TELEGRAM_DOWNLOAD_STALL_TIMEOUT_SECONDS` | `120` | Per-lane no-data timeout before sequential fallback. |
+| `MAX_FILE_SIZE_BYTES` | `0` | Application file-size ceiling; `0` disables it. |
+| `MIN_FREE_DISK_BYTES` | `5368709120` | Free space that must remain in addition to the incoming file size. |
+| `DELETE_LOCAL_AFTER_SUCCESS` | `true` | Remove local data after verified cloud completion. |
 
-`config/users` is intentionally mounted writable. Google Drive refresh tokens
-are stored in each user's rclone configuration, and rclone persists refreshed
-tokens by atomically replacing that file. A read-only mount can make an upload
-retry after its data was committed. Restrict the host directory to the service
-account rather than mounting it read-only.
+Increasing workers, download lanes, rclone transfers, or Drive chunk size can
+increase memory, disk I/O, network use, and Telegram flood waits. Change one
+control at a time and measure the result.
 
-On Linux, prepare the mounted rclone configuration for container UID/GID `10001:10001`:
+### Administration and logging
 
-```bash
-sudo chown -R 10001:10001 config/users data
-sudo chmod 700 config/users data/users data/pending-telegram
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ADMIN_TELEGRAM_USER_ID` | empty | Numeric account allowed to run `/db` commands; empty disables them. |
+| `ADMIN_CONTACT` | empty | Reserved compatibility value; the current command flow does not read it. |
+| `LOG_LEVEL` | `INFO` | Python log level. |
+| `LOG_FILE` | `/data/logs/uploader.log` | Rotating file log. |
+| `LOG_MAX_BYTES` | `10485760` | Maximum bytes per log file. |
+| `LOG_BACKUP_COUNT` | `5` | Number of rotated log files retained. |
+
+## Persistent data
+
+The runtime mounts two host directories:
+
+```text
+data/
+├── app.db
+├── app.db-wal
+├── app.db-shm
+├── bot.session
+├── bot.session-journal
+├── logs/
+├── pending-telegram/
+└── users/
+    └── <telegram-user-id>/
+        ├── telegram.session
+        └── downloads/
+
+config/users/
+└── <telegram-user-id>/
+    └── rclone.conf
 ```
 
-The application never changes these host permissions automatically.
+SQLite stores:
 
-Repository and Docker context rules exclude `.env` variants, Telegram sessions, rclone configuration, downloads, state, logs, image archives, private keys, IDE metadata, and caches. `.env.example` contains placeholders only. Never add production credentials to workflow YAML or Compose files; keep them in GitHub Actions secrets and server-mounted runtime files.
+- Telegram user profile and connection flags;
+- selected remote, root directory, and child directory;
+- temporary Telegram login state;
+- hashed onboarding tokens and web sessions;
+- hashed OAuth state bound to a web session;
+- verified Google remote names, Google account IDs, and account emails;
+- job ownership, status, destination snapshot, local/remote paths, timestamps,
+  and errors.
 
-## Testing and updates
+Telegram authorization keys and Google access/refresh tokens are not stored in
+SQLite. They live in the per-user Telethon session and rclone configuration
+files.
+
+### Backup
+
+Stop the service for a consistent filesystem backup:
 
 ```bash
+cd ~/telegram-uploader
+docker compose -f docker-compose.prod.yml stop telegram-uploader
+tar -czf telegram-stremio-backup.tar.gz .env data config/users
+docker compose -f docker-compose.prod.yml start telegram-uploader
+```
+
+Encrypt and protect the archive. It contains credentials that can access
+Telegram accounts and Google Drives.
+
+## Security and privacy model
+
+- The bot accepts files only in private conversations.
+- A job is resolved only by its owner's Telethon client.
+- There is no shared Telegram processing group.
+- One user's Telegram session never searches another user's conversation.
+- User sessions, downloads, and rclone configurations use separate
+  user-ID-based directories.
+- Setup links are single-use and expire.
+- Web sessions use HTTP-only, secure, same-site cookies.
+- OAuth state is single-use and bound to the initiating web session.
+- Google connections are verified before they are saved and before jobs are
+  accepted.
+- Filenames, root directories, child directories, and remote names are
+  validated.
+- Subprocesses are launched with argument arrays rather than shell strings.
+- The container runs as a non-root user with dropped capabilities.
+- Port 8080 is bound to host loopback in Compose.
+- `.gitignore` and `.dockerignore` exclude credentials, sessions, databases,
+  downloads, logs, keys, and image archives.
+
+`config/users` must remain writable because rclone refreshes OAuth tokens by
+updating its configuration. Protect the host directory with permissions rather
+than mounting it read-only.
+
+## Operations
+
+### Status and logs
+
+```bash
+docker compose -f docker-compose.prod.yml ps
+docker stats --no-stream telegram-uploader
+docker compose -f docker-compose.prod.yml logs -f telegram-uploader
+curl -fsS http://127.0.0.1:8080/healthz
+```
+
+The health endpoint verifies that the application has an open database
+connection. It does not perform Telegram or Google API calls.
+
+### Restart or update
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --force-recreate
+```
+
+Active download/upload jobs are returned to the queue on application startup.
+
+### Disconnect behavior
+
+The onboarding page supports:
+
+- local Telegram disconnect, which archives the local session files;
+- Telegram logout/revoke, which logs out the Telegram session and deletes it;
+- removal of one selected Google Drive remote.
+
+Removing a Drive selects another connected remote when available. It does not
+remove already uploaded cloud files.
+
+## Testing
+
+Create a virtual environment and install development dependencies:
+
+```bash
+python -m venv .venv
+```
+
+PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
+python -m compileall -q app tests
 python -m pytest -q
-python -m compileall app tests
+```
+
+Linux, macOS, or WSL:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m compileall -q app tests
+python -m pytest -q
+```
+
+Build verification:
+
+```bash
 docker compose build --pull
 docker compose up -d
+docker compose ps
 ```
 
 ## Troubleshooting
 
-- **Telegram session missing/expired:** open `/connect` and reconnect that user's Telegram account.
-- **Remote invalid/quota/permission:** use `/remotes` to confirm the selected remote, then inspect the service logs.
-- **Duplicate Google account:** choose a different Google account; one account cannot occupy two Drive slots for the same Telegram user.
-- **Older Drive has no displayed email:** open `/connect` and select **Add Google Drive**; the service attempts to recover the existing account identity automatically.
-- **Rclone config read-only:** make `config/users` writable by container UID 10001. OAuth token refresh cannot work on a read-only mount.
-- **Unhealthy container:** inspect `/data/state/health.json`, `docker compose ps`, and logs.
-- **Message ignored:** confirm `WATCH_MODE=chat`, the private `WATCH_CHAT_ID`, and that the sender has a position-matched entry in both allowed-user lists.
-- **Startup mapping error:** ensure `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` have the same number of unique comma-separated entries.
-- **Unknown chat ID:** temporarily set `DEBUG_TELEGRAM_IDS=true`, send a group message, copy the logged chat ID, then disable debugging.
-- **Disk rejection:** free space or lower `MIN_FREE_DISK_GB` cautiously.
-- **Flood waits:** transfers continue; progress edits resume later.
-- **File reference expired:** use `.retry`; if Telegram no longer serves it, forward the source again.
+### `/connect` link is invalid or expired
+
+Setup links are single-use. Send `/connect` again and open only the newest
+link. Repeated requests are rate-limited, so wait for the time shown in the
+error before requesting another.
+
+### A localhost link is not clickable in Telegram
+
+Copy the complete URL and paste it into a browser on the computer running
+Docker. Telegram clients generally do not activate `localhost` links.
+
+### The shared-domain link opens another application
+
+Confirm that:
+
+- `PUBLIC_BASE_URL` contains `/uploader`;
+- the matching `/uploader/` Nginx location is inside the active HTTPS server
+  block;
+- `proxy_pass` ends with `/`;
+- Nginx was validated and reloaded.
+
+### Google reports `redirect_uri_mismatch`
+
+The URI in Google Cloud must be identical to `GOOGLE_REDIRECT_URI`. Check the
+scheme, domain, port, path prefix, callback path, and trailing slash.
+
+### Google Drive appears connected without completing consent
+
+The UI considers storage connected only after the OAuth callback exchanges the
+authorization code, obtains a verified account identity, creates the rclone
+remote, and successfully lists the Drive. Refresh the onboarding page or use
+`/status` for a live verification.
+
+### A second Google Drive is rejected
+
+- `MULTY_RCLONE_COUNT` may already be reached.
+- Every slot must use a different Google account.
+- The same Google subject or verified email cannot be connected twice by one
+  Telegram user.
+
+### Telegram login fails or the QR becomes invalid
+
+- Scan the QR currently visible on the onboarding page; Telegram QR tokens
+  rotate during the overall login window.
+- Use phone login when connecting from one mobile device.
+- Enter the international phone number with country code.
+- Respect any Telegram `FloodWait` duration before retrying.
+- The authenticated Telegram ID must match the user who opened `/connect`.
+
+### A submitted file stays queued
+
+- Check `/status`.
+- Confirm the user's Telegram session remains connected.
+- Inspect `MAX_CONCURRENT_USER_WORKERS`; all workers may be occupied by other
+  users.
+- Review container logs for session-restart failures.
+
+### Parallel Telegram download fails and restarts
+
+A lane received no data within
+`TELEGRAM_DOWNLOAD_STALL_TIMEOUT_SECONDS`, or the Telegram media data-center
+connection failed. The service cancels the partial parallel download and
+automatically starts Telethon's sequential downloader. To always download
+sequentially, set:
+
+```env
+TELEGRAM_DOWNLOAD_CONNECTIONS=1
+```
+
+### Telegram reports a flood wait
+
+Telegram is temporarily slowing requests from the account. Telethon waits for
+the required period. Reduce parallel connections or avoid repeatedly starting
+new login/download requests if flood waits are frequent.
+
+### Upload reaches 99.9% and pauses
+
+Progress is intentionally capped at 99.9% until rclone exits and the service
+verifies the exact remote file size. A short finalization pause is normal. A
+long pause should be investigated in the rclone logs and against
+`RCLONE_UPLOAD_TIMEOUT_MINUTES`.
+
+### Upload retries or fails
+
+Check:
+
+- the selected remote with `/remotes` and `/status`;
+- Google account quota and permissions;
+- `config/users/<user-id>/rclone.conf` is writable by UID 10001;
+- the remote file does not conflict with `REMOTE_COLLISION_POLICY`;
+- network connectivity to Google APIs.
+
+The service treats a non-zero rclone exit as successful only when the expected
+remote object can still be verified with the exact source size.
+
+### Insufficient disk space
+
+A job requires:
+
+```text
+incoming file size + MIN_FREE_DISK_BYTES
+```
+
+Free disk space or cautiously lower the reserve. Do not set the reserve to zero
+without monitoring the host.
+
+### Container is unhealthy
+
+```bash
+docker inspect telegram-uploader --format '{{json .State.Health}}'
+docker compose -f docker-compose.prod.yml logs --tail=200 telegram-uploader
+curl -v http://127.0.0.1:8080/healthz
+```
+
+Check database permissions, required credentials, mounted-directory ownership,
+and whether another process already uses port 8080.
+
+## Files that must not be committed
+
+Never commit:
+
+- `.env` or other environment files containing credentials;
+- `data/app.db`, WAL, or shared-memory files;
+- `data/bot.session*`;
+- per-user Telegram sessions;
+- per-user rclone configurations;
+- downloads, pending login data, and logs;
+- SSH keys, TLS private keys, or OAuth secrets;
+- Docker `.tar` or `.tar.gz` image archives.
+
+Commit the application source, tests, Dockerfiles, Compose files, workflow
+files, Nginx examples, `.env.example`, and generated tutorial asset.
