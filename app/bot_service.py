@@ -83,6 +83,10 @@ class BotService:
             await event.reply(self._command_list(self._is_admin(user_id)))
             return
 
+        if command == "/tutorial":
+            await self._send_tutorial(event)
+            return
+
         if command == "/start":
             await self.database.upsert_user(
                 sender,
@@ -290,11 +294,34 @@ class BotService:
         )
 
     @staticmethod
+    async def _send_tutorial(event: Any) -> None:
+        image_path = Path(__file__).with_name("static") / "tutorial-guide.png"
+        text = (
+            "Telegram Stremio - quick tutorial\n\n"
+            "1. Send /connect, connect your Telegram account, then add Google Drive.\n"
+            "2. Optional: choose a Drive with /remote and a folder with /dir.\n"
+            "3. Send or forward a file you are authorized to access and wait for "
+            "Upload completed.\n\n"
+            "Watch from your Google Drive:\n"
+            "- iPhone/iPad: VLC > Network > Cloud Services > Google Drive.\n"
+            "- Android: RS File Manager > Google Drive > open the file with VLC.\n"
+            "- Android TV: install RS File Manager and VLC, open Google Drive in "
+            "RS File Manager, then play the file with VLC.\n\n"
+            "Use /status to check your connections and jobs."
+        )
+        if image_path.is_file():
+            await event.reply(text, file=str(image_path))
+        else:
+            LOG.warning("Tutorial image is missing: %s", image_path)
+            await event.reply(text)
+
+    @staticmethod
     def _command_list(is_admin: bool) -> str:
         commands = [
             "Commands available to you:",
             "/start - register this private chat",
             "/connect - open or manage secure onboarding",
+            "/tutorial - show setup and playback guide",
             "/status - show your connections and jobs",
             "/cancel [job-id] - cancel your job",
             "/dirroot [name|default] - show or select your root directory",

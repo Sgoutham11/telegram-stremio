@@ -275,9 +275,11 @@ Drive when available.
 ## Commands
 
 All interaction occurs privately with the bot. Use `/start`, `/connect`,
-`/status`, `/cancel [job-id]`, `/help`, `/ls`, `/dirroot [name|default]`,
-`/dir [path]`, `/remote [name]`, and `/remotes`. `/ls` lists only the
-commands available to the requesting user.
+`/tutorial`, `/status`, `/cancel [job-id]`, `/help`, `/ls`,
+`/dirroot [name|default]`, `/dir [path]`, `/remote [name]`, and `/remotes`.
+`/tutorial` sends a compact illustrated setup and playback guide for
+iPhone/iPad, Android, and Android TV. `/ls` lists only the commands available
+to the requesting user.
 
 Set `ADMIN_TELEGRAM_USER_ID` to the administrator's numeric Telegram user ID
 to enable read-only operational commands for that account:
