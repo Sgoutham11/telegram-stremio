@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import configparser
 import json
 import logging
 import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable
+
+import httpx
 
 from .config import Settings
 from .exceptions import UploadError
@@ -124,6 +127,49 @@ class RcloneService:
             )
             return False
 
+    async def google_drive_identity(
+        self, user_id: int, remote: str
+    ) -> tuple[str, str] | None:
+        """Recover the account identity for a pre-identity Drive connection."""
+        selected = await self.validate_remote(user_id, remote)
+        if not await self.verify_connection(user_id, selected):
+            return None
+        config = self.config_path(user_id)
+        parser = configparser.RawConfigParser(interpolation=None)
+        try:
+            with config.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+            token_value = parser.get(selected, "token")
+            token = json.loads(token_value)
+            access_token = str(token.get("access_token") or "")
+            if not access_token:
+                return None
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    "https://www.googleapis.com/drive/v3/about",
+                    params={"fields": "user(permissionId,emailAddress)"},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                response.raise_for_status()
+            user = response.json().get("user") or {}
+            account_id = str(user.get("permissionId") or "").strip()
+            email = str(user.get("emailAddress") or "").strip().casefold()
+            return (account_id, email) if account_id and email else None
+        except (
+            configparser.Error,
+            json.JSONDecodeError,
+            OSError,
+            httpx.HTTPError,
+            TypeError,
+            AttributeError,
+        ):
+            LOG.warning(
+                "Unable to recover Google Drive identity for user %s remote %s",
+                user_id,
+                selected,
+            )
+            return None
+
     async def create_google_drive(
         self,
         user_id: int,
@@ -177,7 +223,6 @@ class RcloneService:
             remote,
             "--config",
             str(config),
-            "--non-interactive",
         )
         if code:
             raise UploadError(f"Unable to remove Google Drive connection: {error[:300]}")

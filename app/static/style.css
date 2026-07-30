@@ -50,6 +50,7 @@ button {
 button.secondary { background: #343843; }
 button:disabled { opacity: .55; cursor: wait; }
 input { margin: 8px 0; padding: 10px; border: 1px solid #444a58; background: #090a0d; color: white; }
+#login-methods { margin-top: 12px; }
 #qr-image { display: block; width: min(100%, 300px); margin: 18px auto; border-radius: 12px; }
 .notice { min-height: 1.5em; color: #ffb8bc; }
 .active { color: #61d68b; font-weight: 800; }

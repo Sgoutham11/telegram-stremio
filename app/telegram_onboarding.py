@@ -5,6 +5,7 @@ import base64
 import io
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,6 +18,13 @@ from telethon.errors import (
     AuthKeyError,
     FloodWaitError,
     PasswordHashInvalidError,
+    PhoneCodeEmptyError,
+    PhoneCodeExpiredError,
+    PhoneCodeHashEmptyError,
+    PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberInvalidError,
+    PhoneNumberUnoccupiedError,
     RPCError,
     SessionPasswordNeededError,
 )
@@ -37,16 +45,20 @@ class PendingLogin:
     session_path: Path
     client: Any
     expires_at: str
+    login_method: str = "qr"
     status: TelegramLoginStatus = TelegramLoginStatus.QR_LOADING
     qr_image: str | None = None
+    phone_number: str | None = None
+    phone_code_hash: str | None = None
     message: str | None = None
     attempts: int = 0
+    code_attempts: int = 0
     task: asyncio.Task[None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class TelegramOnboardingManager:
-    """Maintains temporary QR clients and atomically promotes valid sessions."""
+    """Maintains temporary login clients and atomically promotes valid sessions."""
 
     def __init__(
         self,
@@ -64,6 +76,147 @@ class TelegramOnboardingManager:
         self.accepting = True
 
     async def start(self, user_id: int) -> dict[str, str]:
+        """Start QR authentication (kept as the compatibility entry point)."""
+        pending, created = await self._new_pending(
+            user_id, "qr", TelegramLoginStatus.QR_LOADING
+        )
+        if not created:
+            return self._response(pending)
+        client = pending.client
+        try:
+            await client.connect()
+            qr_login = await client.qr_login()
+            pending.qr_image = self._qr_data_uri(qr_login.url)
+            pending.status = TelegramLoginStatus.WAITING_FOR_SCAN
+            await self._persist(pending)
+            pending.task = asyncio.create_task(self._wait_for_qr(pending, qr_login))
+            return self._response(pending)
+        except Exception:
+            await self._fail(pending, "QR_START_FAILED")
+            raise RuntimeError("Unable to start Telegram QR login")
+
+    async def start_phone(self, user_id: int, phone_number: str) -> dict[str, str]:
+        phone = self._normalize_phone(phone_number)
+        pending, created = await self._new_pending(
+            user_id, "phone", TelegramLoginStatus.PHONE_CODE_LOADING
+        )
+        if not created:
+            return self._response(pending)
+        pending.phone_number = phone
+        try:
+            await pending.client.connect()
+            sent = await pending.client.send_code_request(phone)
+            phone_code_hash = str(getattr(sent, "phone_code_hash", "") or "")
+            if not phone_code_hash:
+                raise PhoneCodeHashEmptyError(request=None)
+            pending.phone_code_hash = phone_code_hash
+            pending.status = TelegramLoginStatus.WAITING_FOR_CODE
+            pending.message = (
+                "Telegram sent a login code. Enter it below. "
+                "Never share this code with another person."
+            )
+            await self._persist(pending)
+            return self._response(pending)
+        except FloodWaitError as exc:
+            pending.message = (
+                f"Telegram rate limited login requests. Try again in "
+                f"{exc.seconds} seconds."
+            )
+            await self._fail(pending, "PHONE_FLOOD_WAIT", keep_message=True)
+            return self._response(pending)
+        except PhoneNumberInvalidError:
+            pending.message = "Enter a valid phone number including country code."
+            await self._fail(pending, "PHONE_NUMBER_INVALID", keep_message=True)
+            return self._response(pending)
+        except PhoneNumberUnoccupiedError:
+            pending.message = "No Telegram account exists for this phone number."
+            await self._fail(pending, "PHONE_NUMBER_UNOCCUPIED", keep_message=True)
+            return self._response(pending)
+        except PhoneNumberBannedError:
+            pending.message = "Telegram has restricted this phone number."
+            await self._fail(pending, "PHONE_NUMBER_BANNED", keep_message=True)
+            return self._response(pending)
+        except (AuthKeyError, RPCError, TimeoutError):
+            await self._fail(pending, "PHONE_CODE_SEND_FAILED")
+            return self._response(pending)
+        except Exception:
+            LOG.exception(
+                "Telegram phone login failed to start for connection %s",
+                pending.connection_id,
+            )
+            await self._fail(pending, "PHONE_CODE_SEND_FAILED")
+            return self._response(pending)
+
+    async def submit_code(
+        self, connection_id: str, user_id: int, code: str
+    ) -> dict[str, str]:
+        pending = self._pending.get(connection_id)
+        if not pending or pending.user_id != user_id:
+            raise KeyError("Telegram connection not found")
+        if self._expired(pending):
+            await self._expire(pending)
+            return self._response(pending)
+        normalized_code = re.sub(r"\s+", "", code)
+        if not re.fullmatch(r"[0-9]{5,10}", normalized_code):
+            raise ValueError("Enter the numeric login code sent by Telegram")
+        async with pending.lock:
+            if (
+                pending.login_method != "phone"
+                or pending.status != TelegramLoginStatus.WAITING_FOR_CODE
+                or not pending.phone_number
+                or not pending.phone_code_hash
+            ):
+                raise ValueError("This connection is not waiting for a login code")
+            pending.code_attempts += 1
+            try:
+                await pending.client.sign_in(
+                    phone=pending.phone_number,
+                    code=normalized_code,
+                    phone_code_hash=pending.phone_code_hash,
+                )
+                pending.status = TelegramLoginStatus.CONNECTING
+                pending.message = None
+                await self._persist(pending)
+                await self._finalize(pending)
+            except SessionPasswordNeededError:
+                pending.status = TelegramLoginStatus.TWO_FACTOR_REQUIRED
+                pending.expires_at = expires_at(
+                    self.settings.telegram_2fa_ttl_seconds
+                )
+                pending.message = (
+                    "Enter your Telegram two-step verification password."
+                )
+                await self._persist(pending)
+            except (PhoneCodeEmptyError, PhoneCodeInvalidError):
+                if (
+                    pending.code_attempts
+                    >= self.settings.max_telegram_code_attempts
+                ):
+                    await self._fail(pending, "MAX_CODE_ATTEMPTS")
+                else:
+                    pending.message = "Incorrect login code. Please try again."
+                    await self._persist(pending)
+            except (PhoneCodeExpiredError, PhoneCodeHashEmptyError):
+                pending.message = (
+                    "This Telegram login code expired. Start a new connection."
+                )
+                await self._fail(pending, "PHONE_CODE_EXPIRED", keep_message=True)
+            except FloodWaitError as exc:
+                pending.message = (
+                    f"Telegram rate limited this login. Try again in "
+                    f"{exc.seconds} seconds."
+                )
+                await self._persist(pending)
+            except (AuthKeyError, RPCError, TimeoutError):
+                await self._fail(pending, "TELEGRAM_AUTH_FAILED")
+        return self._response(pending)
+
+    async def _new_pending(
+        self,
+        user_id: int,
+        login_method: str,
+        initial_status: TelegramLoginStatus,
+    ) -> tuple[PendingLogin, bool]:
         if not self.accepting:
             raise RuntimeError("Application is shutting down")
         async with self._lock:
@@ -82,7 +235,7 @@ class TelegramOnboardingManager:
                 None,
             )
             if active:
-                return self._response(active)
+                return active, False
             active_count = sum(
                 login.status
                 not in {
@@ -109,7 +262,13 @@ class TelegramOnboardingManager:
                 user_id=user_id,
                 session_path=session_path,
                 client=client,
-                expires_at=expires_at(self.settings.qr_login_ttl_seconds),
+                expires_at=expires_at(
+                    self.settings.qr_login_ttl_seconds
+                    if login_method == "qr"
+                    else self.settings.phone_login_ttl_seconds
+                ),
+                login_method=login_method,
+                status=initial_status,
             )
             self._pending[connection_id] = pending
 
@@ -124,22 +283,12 @@ class TelegramOnboardingManager:
                 connection_id,
                 user_id,
                 str(session_path),
-                TelegramLoginStatus.QR_LOADING.value,
+                initial_status.value,
                 utcnow_text(),
                 pending.expires_at,
             ),
         )
-        try:
-            await client.connect()
-            qr_login = await client.qr_login()
-            pending.qr_image = self._qr_data_uri(qr_login.url)
-            pending.status = TelegramLoginStatus.WAITING_FOR_SCAN
-            await self._persist(pending)
-            pending.task = asyncio.create_task(self._wait_for_qr(pending, qr_login))
-            return self._response(pending)
-        except Exception:
-            await self._fail(pending, "QR_START_FAILED")
-            raise RuntimeError("Unable to start Telegram QR login")
+        return pending, True
 
     async def status(self, connection_id: str, user_id: int) -> dict[str, str]:
         pending = self._pending.get(connection_id)
@@ -266,6 +415,8 @@ class TelegramOnboardingManager:
         await self.clients.start_user(pending.user_id)
         pending.status = TelegramLoginStatus.CONNECTED
         pending.qr_image = None
+        pending.phone_number = None
+        pending.phone_code_hash = None
         pending.message = (
             "Telegram connected. Files sent privately to the bot will be "
             "resolved through this account."
@@ -282,7 +433,7 @@ class TelegramOnboardingManager:
             """,
             (
                 pending.status.value,
-                pending.attempts,
+                pending.attempts + pending.code_attempts,
                 pending.expires_at,
                 None,
                 pending.connection_id,
@@ -294,6 +445,8 @@ class TelegramOnboardingManager:
     ) -> None:
         pending.status = TelegramLoginStatus.FAILED
         pending.qr_image = None
+        pending.phone_number = None
+        pending.phone_code_hash = None
         if not keep_message:
             pending.message = "Telegram connection failed. Start a new connection."
         if pending.task and pending.task is not asyncio.current_task():
@@ -310,7 +463,7 @@ class TelegramOnboardingManager:
             """,
             (
                 pending.status.value,
-                pending.attempts,
+                pending.attempts + pending.code_attempts,
                 error_code,
                 pending.connection_id,
             ),
@@ -319,8 +472,12 @@ class TelegramOnboardingManager:
 
     async def _expire(self, pending: PendingLogin) -> None:
         pending.status = TelegramLoginStatus.EXPIRED
-        pending.message = "This QR login expired. Start a new connection."
+        pending.message = (
+            "This Telegram login expired. Start a new connection."
+        )
         pending.qr_image = None
+        pending.phone_number = None
+        pending.phone_code_hash = None
         if pending.task and pending.task is not asyncio.current_task():
             pending.task.cancel()
         try:
@@ -396,9 +553,19 @@ class TelegramOnboardingManager:
         return datetime.fromisoformat(pending.expires_at) <= datetime.now(timezone.utc)
 
     @staticmethod
+    def _normalize_phone(phone_number: str) -> str:
+        compact = re.sub(r"[\s()-]", "", phone_number.strip())
+        if not re.fullmatch(r"\+[1-9][0-9]{6,14}", compact):
+            raise ValueError(
+                "Enter the phone number in international format, for example +919876543210"
+            )
+        return compact
+
+    @staticmethod
     def _response(pending: PendingLogin) -> dict[str, str]:
         response = {
             "connectionId": pending.connection_id,
+            "loginMethod": pending.login_method,
             "status": pending.status.value,
             "expiresAt": pending.expires_at,
         }

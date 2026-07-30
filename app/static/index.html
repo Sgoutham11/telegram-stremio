@@ -16,6 +16,26 @@
       <h2>Telegram Account</h2>
       <p id="telegram-status">Not connected</p>
       <button id="telegram-connect">Connect Telegram</button>
+      <div id="login-methods" hidden>
+        <h3>Choose a login method</h3>
+        <button id="telegram-connect-phone">Phone number + login code</button>
+        <button id="telegram-connect-qr" class="secondary">QR code</button>
+      </div>
+      <form id="phone-start" hidden>
+        <h3>Login with phone number</h3>
+        <p>Include the country code, for example +919876543210.</p>
+        <input id="telegram-phone" type="tel" inputmode="tel"
+               autocomplete="tel" placeholder="+919876543210" required>
+        <button type="submit">Send Telegram login code</button>
+      </form>
+      <form id="phone-code" hidden>
+        <h3>Enter Telegram login code</h3>
+        <p>Use the code Telegram sent to your account. Never share it with anyone.</p>
+        <input id="telegram-code" type="text" inputmode="numeric"
+               autocomplete="one-time-code" pattern="[0-9]{5,10}"
+               placeholder="Login code" required>
+        <button type="submit">Verify login code</button>
+      </form>
       <div id="qr-panel" hidden>
         <p>In Telegram, open Settings → Devices → Link Desktop Device.</p>
         <p>Scan the currently displayed code. It refreshes automatically.</p>
