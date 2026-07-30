@@ -47,20 +47,7 @@ class GoogleOAuthService:
             )
         ):
             raise RuntimeError("Google OAuth is not configured")
-        connections = [
-            row
-            for row in await self.database.storage_connections(user_id)
-            if row["provider"] == "google"
-        ]
-        if any(
-            not row["provider_account_id"] or not row["account_email"]
-            for row in connections
-        ):
-            raise StorageConnectionError(
-                "legacy",
-                "Reconnect the existing Google Drive before adding another "
-                "so its account identity can be verified.",
-            )
+        connections = await self._google_connections(user_id)
         if len(connections) >= self.settings.multy_rclone_count:
             raise StorageConnectionError(
                 "limit",
@@ -121,11 +108,7 @@ class GoogleOAuthService:
                 "Google did not return a verified account email.",
             )
         async with self._user_locks[user_id]:
-            connections = [
-                row
-                for row in await self.database.storage_connections(user_id)
-                if row["provider"] == "google"
-            ]
+            connections = await self._google_connections(user_id)
             if any(
                 row["provider"] == "google"
                 and (
@@ -236,3 +219,36 @@ class GoogleOAuthService:
         raise StorageConnectionError(
             "limit", "No storage remote slot is available."
         )
+
+    async def _google_connections(self, user_id: int) -> list[dict[str, Any]]:
+        connections = [
+            row
+            for row in await self.database.storage_connections(user_id)
+            if row["provider"] == "google"
+        ]
+        changed = False
+        for connection in connections:
+            if connection["provider_account_id"] and connection["account_email"]:
+                continue
+            identity = await self.rclone.google_drive_identity(
+                user_id, str(connection["remote_name"])
+            )
+            if not identity:
+                continue
+            account_id, email = identity
+            await self.database.execute(
+                """
+                UPDATE storage_connections
+                SET provider_account_id=?, account_email=?, updated_at=?
+                WHERE id=?
+                """,
+                (account_id, email, utcnow_text(), connection["id"]),
+            )
+            changed = True
+        if changed:
+            connections = [
+                row
+                for row in await self.database.storage_connections(user_id)
+                if row["provider"] == "google"
+            ]
+        return connections

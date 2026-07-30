@@ -10,7 +10,11 @@ async function api(url, options = {}) {
     ...options
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || "Request failed");
+  if (!response.ok) {
+    const detail = typeof body.detail === "string"
+      ? body.detail : `Request failed (${response.status})`;
+    throw new Error(detail);
+  }
   return body;
 }
 
@@ -25,8 +29,6 @@ if (storageResult === "failed") {
   notice("You have reached the Google Drive connection limit.");
 } else if (storageResult === "identity") {
   notice("Google did not return a verified account email.");
-} else if (storageResult === "legacy") {
-  notice("Disconnect and reconnect the existing Google Drive once before adding another.");
 } else if (storageResult === "connected") {
   notice("Google Drive connected.");
 }
@@ -60,29 +62,84 @@ async function refresh() {
 
 function applyLogin(login) {
   connectionId = login.connectionId;
+  $("login-methods").hidden = true;
+  $("phone-start").hidden = true;
   $("qr-panel").hidden = login.status !== "WAITING_FOR_SCAN";
+  $("phone-code").hidden = login.status !== "WAITING_FOR_CODE";
   $("two-factor").hidden = login.status !== "TWO_FACTOR_REQUIRED";
   if (login.qrImage) $("qr-image").src = login.qrImage;
   if (login.message) notice(login.message);
   if (login.status === "CONNECTED") {
     clearInterval(pollTimer);
     $("qr-panel").hidden = true;
+    $("phone-code").hidden = true;
     $("two-factor").hidden = true;
     refresh();
   }
-  if (["FAILED", "EXPIRED"].includes(login.status)) clearInterval(pollTimer);
+  if (["FAILED", "EXPIRED"].includes(login.status)) {
+    clearInterval(pollTimer);
+    $("telegram-connect").hidden = false;
+  }
 }
 
-$("telegram-connect").addEventListener("click", async () => {
+function startLoginPolling() {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try { applyLogin(await api(`api/telegram/connect/status/${connectionId}`)); }
+    catch (error) { notice(error.message); clearInterval(pollTimer); }
+  }, 2000);
+}
+
+$("telegram-connect").addEventListener("click", () => {
+  notice();
+  $("telegram-connect").hidden = true;
+  $("login-methods").hidden = false;
+});
+
+$("telegram-connect-phone").addEventListener("click", () => {
+  $("login-methods").hidden = true;
+  $("phone-start").hidden = false;
+  $("telegram-phone").focus();
+});
+
+$("telegram-connect-qr").addEventListener("click", async () => {
   notice();
   try {
     const login = await api("api/telegram/connect/start", {method: "POST"});
     applyLogin(login);
-    clearInterval(pollTimer);
-    pollTimer = setInterval(async () => {
-      try { applyLogin(await api(`api/telegram/connect/status/${connectionId}`)); }
-      catch (error) { notice(error.message); clearInterval(pollTimer); }
-    }, 2000);
+    startLoginPolling();
+  } catch (error) {
+    notice(error.message);
+    $("telegram-connect").hidden = false;
+  }
+});
+
+$("phone-start").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  notice();
+  try {
+    const login = await api("api/telegram/connect/phone/start", {
+      method: "POST",
+      body: JSON.stringify({phoneNumber: $("telegram-phone").value})
+    });
+    $("telegram-phone").value = "";
+    applyLogin(login);
+    if (!["FAILED", "EXPIRED"].includes(login.status)) startLoginPolling();
+  } catch (error) {
+    notice(error.message);
+    $("phone-start").hidden = false;
+  }
+});
+
+$("phone-code").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const code = $("telegram-code").value;
+  $("telegram-code").value = "";
+  try {
+    applyLogin(await api("api/telegram/connect/phone/code", {
+      method: "POST",
+      body: JSON.stringify({connectionId, code})
+    }));
   } catch (error) { notice(error.message); }
 });
 

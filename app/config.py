@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     web_host: str = "0.0.0.0"
     web_port: int = Field(8080, ge=1, le=65535)
     qr_login_ttl_seconds: int = Field(120, ge=30, le=600)
+    phone_login_ttl_seconds: int = Field(300, ge=60, le=1800)
+    max_telegram_code_attempts: int = Field(5, ge=1, le=10)
     telegram_2fa_ttl_seconds: int = Field(300, ge=30, le=1800)
     max_telegram_2fa_attempts: int = Field(5, ge=1, le=10)
     web_session_ttl_seconds: int = Field(1800, ge=60, le=86400)

@@ -89,6 +89,11 @@ and so on. A newly connected Drive becomes the selected destination. Tokens
 and rclone configuration remain private under
 `/config/users/<telegram-user-id>/rclone.conf`.
 
+Connections created by an older application version are upgraded
+automatically: the service reads the authenticated user's ID and email from
+Google Drive before opening the next account chooser. The existing Drive does
+not need to be disconnected.
+
 ## Local development
 
 The default [docker-compose.yml](docker-compose.yml) builds the current checkout and is intended for local development:
@@ -294,11 +299,18 @@ that private reply, follows its `reply_to_msg_id` to the owner's original media
 message, and downloads it. No external user is added to a common group and no
 user session can see another user's bot conversation.
 
+The `/connect` page lets the user choose either QR login or phone-number login.
+Phone login accepts an international number such as `+919876543210`, sends a
+Telegram login code, and then requests the Telegram two-step-verification
+password when that account has one. The service never writes the phone number,
+login code, or password to SQLite.
+
 Telegram QR tokens are short-lived even though the overall onboarding window
 is longer. While the connection page remains open, the service automatically
-recreates expired Telegram QR tokens and the browser replaces the displayed
-image during its normal status polling. Always scan the currently visible QR;
-an older photograph cannot be accepted after its embedded token expires.
+recreates expired QR tokens and replaces the displayed image. Always scan the
+currently visible QR; an older photograph cannot be accepted after its
+embedded token expires. On a single mobile device, use the phone-number option
+instead.
 
 ## Configuration reference
 
@@ -310,6 +322,13 @@ each Telegram user can connect. Important controls also include
 size ceiling, progress interval, rclone retry/checker/transfer parameters,
 collision policy (`rename`, `overwrite`, `skip`), rotating logs, and local
 cleanup after successful uploads.
+
+`PHONE_LOGIN_TTL_SECONDS=300` controls how long a phone-code login remains
+open, and `MAX_TELEGRAM_CODE_ATTEMPTS=5` limits incorrect code submissions.
+`TELEGRAM_2FA_TTL_SECONDS` and `MAX_TELEGRAM_2FA_ATTEMPTS` independently
+control the optional two-step-verification stage. `MAX_PENDING_QR_LOGINS`
+remains the compatibility name for the global number of simultaneous
+Telegram onboarding flows; it limits both QR and phone logins.
 
 `MAX_CONCURRENT_USER_WORKERS=2` allows two distinct users to process one file
 each in parallel, from Telegram download through cloud upload. A single user
@@ -380,7 +399,7 @@ docker compose up -d
 - **Telegram session missing/expired:** open `/connect` and reconnect that user's Telegram account.
 - **Remote invalid/quota/permission:** use `/remotes` to confirm the selected remote, then inspect the service logs.
 - **Duplicate Google account:** choose a different Google account; one account cannot occupy two Drive slots for the same Telegram user.
-- **Older connection has no account identity:** disconnect and reconnect that Drive once, then add the next Drive.
+- **Older Drive has no displayed email:** open `/connect` and select **Add Google Drive**; the service attempts to recover the existing account identity automatically.
 - **Rclone config read-only:** make `config/users` writable by container UID 10001. OAuth token refresh cannot work on a read-only mount.
 - **Unhealthy container:** inspect `/data/state/health.json`, `docker compose ps`, and logs.
 - **Message ignored:** confirm `WATCH_MODE=chat`, the private `WATCH_CHAT_ID`, and that the sender has a position-matched entry in both allowed-user lists.

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from .client_manager import TelegramClientManager
 from .config import Settings
 from .database import Database
+from .exceptions import UploadError
 from .oauth_service import GoogleOAuthService, StorageConnectionError
 from .rclone_service import RcloneService
 from .security import RateLimiter, expires_at, random_token, resolve_web_user, token_hash
@@ -22,6 +23,15 @@ from .telegram_onboarding import TelegramOnboardingManager
 class TwoFactorRequest(BaseModel):
     connectionId: str = Field(min_length=20, max_length=100)
     password: str = Field(min_length=1, max_length=1024)
+
+
+class PhoneLoginStartRequest(BaseModel):
+    phoneNumber: str = Field(min_length=7, max_length=32)
+
+
+class PhoneLoginCodeRequest(BaseModel):
+    connectionId: str = Field(min_length=20, max_length=100)
+    code: str = Field(min_length=5, max_length=16)
 
 
 class TelegramDisconnectRequest(BaseModel):
@@ -56,7 +66,10 @@ def create_web_app(
     @app.middleware("http")
     async def private_cache_headers(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path == "/connect" or request.url.path.startswith("/api/"):
+        if (
+            request.url.path in {"/", "/connect"}
+            or request.url.path.startswith(("/api/", "/static/"))
+        ):
             response.headers["Cache-Control"] = "no-store"
             response.headers["Pragma"] = "no-cache"
         return response
@@ -160,6 +173,41 @@ def create_web_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
+    @app.post("/api/telegram/connect/phone/start")
+    async def start_telegram_phone(
+        payload: PhoneLoginStartRequest, request: Request
+    ) -> dict[str, str]:
+        user, _ = await session(request)
+        user_id = int(user["telegram_user_id"])
+        limiter.check("phone-start", str(user_id), 3, 600)
+        try:
+            return await onboarding.start_phone(user_id, payload.phoneNumber)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @app.post("/api/telegram/connect/phone/code")
+    async def submit_telegram_code(
+        payload: PhoneLoginCodeRequest, request: Request
+    ) -> dict[str, str]:
+        user, _ = await session(request)
+        user_id = int(user["telegram_user_id"])
+        limiter.check(
+            "phone-code",
+            str(user_id),
+            settings.max_telegram_code_attempts,
+            600,
+        )
+        try:
+            return await onboarding.submit_code(
+                payload.connectionId, user_id, payload.code
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Connection not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
     @app.get("/api/telegram/connect/status/{connection_id}")
     async def telegram_status(
         connection_id: str, request: Request
@@ -258,12 +306,17 @@ def create_web_app(
 
     @app.post("/api/storage/google/disconnect")
     async def disconnect_google(
-        payload: StorageDisconnectRequest, request: Request
+        request: Request,
+        payload: Annotated[StorageDisconnectRequest | None, Body()] = None,
     ) -> dict[str, str]:
         user, _ = await session(request)
         user_id = int(user["telegram_user_id"])
         limiter.check("storage-disconnect", str(user_id), 3, 600)
-        remote = (payload.remote or user["selected_remote"] or "").strip()
+        remote = (
+            (payload.remote if payload else None)
+            or user["selected_remote"]
+            or ""
+        ).strip()
         connections = [
             row
             for row in await database.storage_connections(user_id)
@@ -275,7 +328,10 @@ def create_web_app(
         )
         if not connection:
             raise HTTPException(status_code=404, detail="Storage remote not found")
-        await rclone.disconnect_storage(user_id, remote)
+        try:
+            await rclone.disconnect_storage(user_id, remote)
+        except UploadError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         await database.execute(
             """
             DELETE FROM storage_connections
