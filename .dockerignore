@@ -8,6 +8,7 @@
 .pytest_cache
 data
 config/rclone
+config/users
 tests
 requirements-dev.txt
 *.tar

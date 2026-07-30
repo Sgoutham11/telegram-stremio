@@ -8,15 +8,14 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data/downloads:/data/downloads
-      - ./data/state:/data/state
-      - ./data/session:/data/session
-      - ./data/logs:/data/logs
-      - ./config/rclone:/config/rclone
+      - ./data:/data
+      - ./config/users:/config/users
+    ports:
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
-    stop_grace_period: 60s
+    stop_grace_period: 90s
     healthcheck:
-      test: ["CMD", "/app/scripts/healthcheck.sh"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -25,4 +24,3 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-

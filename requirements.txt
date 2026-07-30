@@ -2,3 +2,9 @@ telethon==1.40.0
 cryptg==0.6.0
 pydantic==2.11.7
 pydantic-settings==2.10.1
+aiosqlite==0.21.0
+fastapi==0.116.1
+uvicorn==0.35.0
+httpx==0.28.1
+qrcode==8.2
+pillow==11.3.0

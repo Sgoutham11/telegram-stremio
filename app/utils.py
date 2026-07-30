@@ -19,6 +19,26 @@ def sanitize_filename(name: str, fallback: str = "file", max_bytes: int = 240) -
     return (stem or fallback) + suffix
 
 
+def default_root_directory(
+    first_name: str | None, last_name: str | None, user_id: int
+) -> str:
+    """Build the default cloud root from the Telegram first and last names."""
+    combined = f"{first_name or ''}{last_name or ''}".upper()
+    sanitized = re.sub(r"[^A-Z0-9_-]+", "_", combined).strip("._-")
+    sanitized = sanitized[:100].strip("._-")
+    return sanitized or f"USER_{int(user_id)}"
+
+
+def validate_root_directory(value: str) -> str:
+    value = value.strip().upper()
+    if (
+        value in {"", ".", ".."}
+        or not re.fullmatch(r"[A-Z0-9 _-]{1,100}", value)
+    ):
+        raise ValueError("invalid root directory")
+    return value
+
+
 def fallback_filename(message_id: int, media_type: str, timestamp: datetime, mime_type: str | None = None) -> str:
     extension = mimetypes.guess_extension(mime_type or "") or ""
     return sanitize_filename(f"{message_id}_{media_type}_{timestamp:%Y%m%d_%H%M%S}{extension}")
@@ -40,4 +60,3 @@ def format_duration(seconds: float | None) -> str:
     minutes, sec = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h {minutes}m {sec}s" if hours else f"{minutes}m {sec}s"
-

@@ -184,7 +184,33 @@ docker load -i telegram-uploader.tar
 docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphans
 ```
 
-## Per-user persistent upload directories
+## Per-user root and upload directories
+
+Every user has an independent root and child directory. The default root is
+their Telegram first name plus last name, converted to uppercase and sanitised.
+The default child directory remains `DOWNLOADS`.
+
+```text
+Telegram name: Goutham S
+Forward file
+-> GOUTHAMS/DOWNLOADS/file.mkv
+```
+
+Use `/dirroot` privately with the bot to show or override the root:
+
+```text
+/dirroot GOUTHAM
+/dir Movies
+Forward file
+-> GOUTHAM/Movies/file.mkv
+```
+
+Use `/dirroot default` to return to the sanitised Telegram-name root. Both
+preferences persist in SQLite and are captured when a job is accepted, so
+later changes affect only future jobs. `RCLONE_BASE_PATH` is retained as a
+deprecated environment compatibility setting and is not used for new jobs.
+
+### Legacy directory behavior
 
 With `RCLONE_BASE_PATH=UPLOADS`, `DEFAULT_UPLOAD_DIRECTORY=DOWNLOADS`, and the mapping `111111111 -> GOUTHAM`, that user initially uploads to:
 
@@ -196,20 +222,20 @@ Forward file
 That user can select a nested directory for subsequently forwarded files:
 
 ```text
-.dir Series/Friends
+/dir Series/Friends
 Forward file
 → UPLOADS/GOUTHAM/Series/Friends/file.mkv
 ```
 
-Another configured user, such as `GALAXY`, has an independent selection under `UPLOADS/GALAXY/...`; one user's `.dir` command never affects another user. Use `.dir` to show your current directory and `.dir default` or `.dir reset` to restore your own default. Each path segment may contain letters, numbers, spaces, hyphens, and underscores; use `/` between nested folders. Selections survive container and server restarts and are captured when each job is queued, so later changes never alter queued or active jobs.
+Another configured user, such as `GALAXY`, has an independent selection under `UPLOADS/GALAXY/...`; one user's `/dir` command never affects another user. Use `/dir` to show your current directory and `/dir default` or `/dir reset` to restore your own default. Each path segment may contain letters, numbers, spaces, hyphens, and underscores; use `/` between nested folders. Selections survive container and server restarts and are captured when each job is queued, so later changes never alter queued or active jobs.
 
 ## Per-user persistent rclone remotes
 
-Use `.remote` to show your current and available storage, `.remotes` to list the allowlist, and `.remote mega` to select another configured remote. Remote and directory selections are independent:
+Use `/remote` to show your current and available storage, `/remotes` to list the allowlist, and `/remote mega` to select another configured remote. Remote and directory selections are independent:
 
 ```text
-.remote mega
-.dir Movies
+/remote mega
+/dir Movies
 Forward file
 -> mega:UPLOADS/GOUTHAM/Movies/file.mkv
 ```
@@ -218,13 +244,50 @@ Each allowed Telegram user has an independent selection. The remote is captured 
 
 ## Commands
 
-Type `.status`, `.queue`, `.dir [path|default|reset]`, `.remote [storage-name]`, `.remotes`, `.cancel`, `.cancel <message_id>`, `.retry <message_id>`, `.config`, or `.help` in the monitored private group. Chat and sender authorization are applied before command or media processing. `.config` omits secrets.
+All interaction occurs privately with the bot. Use `/start`, `/connect`,
+`/status`, `/cancel [job-id]`, `/help`, `/ls`, `/dirroot [name|default]`,
+`/dir [path]`, `/remote [name]`, and `/remotes`. `/ls` lists only the
+commands available to the requesting user.
+
+Set `ADMIN_TELEGRAM_USER_ID` to the administrator's numeric Telegram user ID
+to enable read-only operational commands for that account:
+
+- `/db user` (or `/db users`) — all users, connection state, destinations,
+  and job totals
+- `/db user <user-id>` — one user's operational details
+- `/db activeworks` — all queued, downloading, and uploading jobs
+- `/db stats` — aggregate user and job counts
+- `/db failed [limit]` — recent failures (1–50, default 10)
+
+These commands never display Telegram session paths, web/onboarding/OAuth
+tokens, or rclone credentials. Leaving `ADMIN_TELEGRAM_USER_ID` blank disables
+the admin command set.
+
+New jobs do not use a shared processing group. The bot replies directly to the
+submitted media with a random job reference. The owner's Telethon session finds
+that private reply, follows its `reply_to_msg_id` to the owner's original media
+message, and downloads it. No external user is added to a common group and no
+user session can see another user's bot conversation.
 
 ## Configuration reference
 
 `.env.example` is the authoritative full reference. `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` are ordered lists that define authorization and each user's top-level cloud directory. `DEFAULT_RCLONE_REMOTE` defines the fallback storage and `ALLOWED_RCLONE_REMOTES` defines the selectable names. `DEBUG_TELEGRAM_IDS=false` is the production-safe default and should be enabled only while discovering initial setup identifiers. Important controls also include `RCLONE_BASE_PATH`, `DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional size ceiling, progress interval, rclone retry/checker/transfer parameters, collision policy (`rename`, `overwrite`, `skip`), local cleanup/failed retention, interrupted-job retry, rotating logs, and optional public links. `REMOTE_FOLDER_PATTERN` is deprecated, retained only for environment compatibility, and has no effect; date folders are disabled. `MAX_FILE_SIZE_GB=0` disables the application ceiling.
 
-Google Drive uploads use `RCLONE_DRIVE_CHUNK_SIZE=64Mi` by default. The observed peak on a 1 GB deployment remained far below the production container's 700 MiB hard limit, leaving room for this larger upload buffer. Larger chunks can improve resumable-upload throughput but consume that much memory per active transfer. Production Compose reserves 256 MiB and limits the service to 128 processes. Keep `MAX_CONCURRENT_JOBS=1`, `RCLONE_TRANSFERS=1`, and `RCLONE_CHECKERS=2` on a 1 GB instance. Google Drive does not support rclone's multi-thread single-file upload interface, so `RCLONE_TRANSFERS` only helps when separate files are uploading concurrently; it does not split one Drive file across parallel streams. `RCLONE_UPLOAD_TIMEOUT_MINUTES=180` stops a genuinely wedged cloud process; active progress is capped at 99.9% until rclone exits and remote size verification succeeds. When rclone retries, Telegram shows the attempt number, current-attempt progress, and the latest available rclone error instead of holding at the previous attempt's 99.9%. INFO-level rclone diagnostics are inspected for Drive/API failures, and `RCLONE_RETRIES_SLEEP_SECONDS=10` pauses between whole-file attempts.
+`MAX_CONCURRENT_USER_WORKERS=2` allows two distinct users to process one file
+each in parallel, from Telegram download through cloud upload. A single user
+can occupy only one worker. The dispatcher selects the oldest queued file for
+each available user and orders candidates by creation time and job ID. Work
+from a third user remains queued until a worker is free, and the Telegram
+status explains that the workers are busy. This preserves submission-time
+priority: earlier user work is selected before later work, including when the
+same user submits another group of files later.
+
+Google Drive uploads use `RCLONE_DRIVE_CHUNK_SIZE=64Mi` by default. Each active
+worker may run one rclone upload, so memory and network usage increase with
+`MAX_CONCURRENT_USER_WORKERS`. On a 1 GB server, begin with `2` and monitor
+container memory and I/O before increasing it. `RCLONE_UPLOAD_TIMEOUT_MINUTES`
+stops a genuinely wedged cloud process; progress remains below completion
+until rclone exits and remote verification succeeds.
 
 If a host repeatedly sends the complete file but loses Google Drive's final response, use `RCLONE_RETRIES=1` and `RCLONE_LOW_LEVEL_RETRIES=1`. The service checks the expected remote path and size up to six times over 30 seconds after a non-zero rclone exit. A committed object is treated as successful; a missing or wrong-sized object remains failed and retained locally for `.retry`.
 

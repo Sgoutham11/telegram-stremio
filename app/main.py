@@ -1,92 +1,128 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import signal
-from pathlib import Path
 
-from .cleanup_service import CleanupService
-from .command_service import CommandService
+import uvicorn
+from telethon import TelegramClient
+
+from .bot_service import BotService
+from .client_manager import TelegramClientManager
 from .config import Settings
-from .directory_service import DirectoryService
-from .file_service import FileService
-from .handlers import register_handlers
+from .database import Database
+from .dispatcher import JobDispatcher
 from .logging_config import configure_logging
-from .progress_service import ProgressService
-from .queue_manager import QueueManager
+from .maintenance import MaintenanceService
+from .oauth_service import GoogleOAuthService
 from .rclone_service import RcloneService
-from .remote_service import RemoteService
-from .state_store import StateStore
-from .telegram_client import create_client
-from .worker import Worker
+from .security import RateLimiter
+from .telegram_onboarding import TelegramOnboardingManager
+from .web import create_web_app
 
 LOG = logging.getLogger(__name__)
-
-
-async def write_health(path: Path, client: object, workers: list[asyncio.Task]) -> None:
-    while True:
-        payload = {"pid": os.getpid(), "telegram_connected": client.is_connected(), "workers_alive": all(not t.done() for t in workers), "queue_manager_alive": True}
-        temporary = path.with_suffix(".tmp")
-        await asyncio.to_thread(temporary.write_text, json.dumps(payload), "utf-8")
-        await asyncio.to_thread(os.replace, temporary, path)
-        await asyncio.sleep(10)
 
 
 async def run() -> None:
     settings = Settings()
     settings.prepare_directories()
     configure_logging(settings)
-    settings.validate_runtime()
-    state = StateStore(settings.state_dir)
-    directories = DirectoryService(settings.state_dir, settings.rclone_base_path, settings.default_upload_directory, settings.allowed_users)
-    await directories.load()
-    queue = QueueManager(settings.queue_max_size)
-    rclone = RcloneService(settings)
-    await rclone.validate_configured_remotes()
-    remotes = RemoteService(settings)
-    await remotes.load()
-    client = create_client(settings)
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("Telegram session is expired or unauthorized; run: python -m app.auth")
-    me = await client.get_me()
-    commands = CommandService(settings, queue, state, directories, remotes)
-    register_handlers(client, settings, queue, state, commands, directories, me.id)
-    progress = ProgressService(client, settings.progress_update_interval_seconds)
-    worker_objects = [Worker(client, settings, queue, state, FileService(settings), rclone, progress) for _ in range(settings.max_concurrent_jobs)]
-    worker_tasks = [asyncio.create_task(w.run(), name=f"worker-{i}") for i, w in enumerate(worker_objects)]
-    if settings.telegram_id_discovery_only:
-        LOG.warning("Telegram ID discovery-only mode is active; uploads and interrupted-job recovery are disabled")
-    else:
-        for job in await state.recover(settings.retry_interrupted_jobs):
-            await queue.add(job)
-    cleanup_task = asyncio.create_task(CleanupService(settings, state, queue).run(), name="cleanup")
-    health_task = asyncio.create_task(write_health(settings.state_dir / "health.json", client, worker_tasks), name="health")
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass
-    LOG.info("Uploader started as Telegram user %s; watch mode=%s", me.id, settings.watch_mode)
-    client_task = asyncio.create_task(client.run_until_disconnected())
-    await asyncio.wait([asyncio.create_task(stop.wait()), client_task], return_when=asyncio.FIRST_COMPLETED)
-    LOG.info("Graceful shutdown started")
-    for task in worker_tasks + [cleanup_task, health_task, client_task]:
-        task.cancel()
-    await asyncio.gather(*worker_tasks, cleanup_task, health_task, client_task, return_exceptions=True)
-    await client.disconnect()
+    database = Database(settings.database_path)
+    bot: TelegramClient | None = None
+    clients: TelegramClientManager | None = None
+    onboarding: TelegramOnboardingManager | None = None
+    dispatcher: JobDispatcher | None = None
+    rclone: RcloneService | None = None
+    bot_service: BotService | None = None
+    server: uvicorn.Server | None = None
+    maintenance: MaintenanceService | None = None
+
+    try:
+        await database.connect()
+        await database.cleanup_expired()
+
+        bot = TelegramClient(
+            str(settings.bot_session_path),
+            settings.telegram_api_id,
+            settings.telegram_api_hash,
+        )
+        await bot.start(bot_token=settings.telegram_bot_token)
+        bot_identity = await bot.get_me()
+
+        clients = TelegramClientManager(settings, database)
+        await clients.start_all_users()
+        rclone = RcloneService(settings)
+        for user in await database.connected_users():
+            user_id = int(user["telegram_user_id"])
+            if user["storage_connected"]:
+                try:
+                    remotes = await rclone.list_remotes(user_id)
+                    if not remotes:
+                        raise RuntimeError("No remotes configured")
+                except Exception:
+                    LOG.exception("Storage validation failed for user %s", user_id)
+                    await database.set_user_fields(user_id, storage_connected=0)
+
+        limiter = RateLimiter()
+        onboarding = TelegramOnboardingManager(settings, database, clients)
+        await onboarding.cleanup_orphans()
+        oauth = GoogleOAuthService(settings, database, rclone)
+        dispatcher = JobDispatcher(
+            settings, database, clients, rclone, bot, int(bot_identity.id)
+        )
+        bot_service = BotService(
+            bot, settings, database, clients, rclone, dispatcher, limiter
+        )
+        bot_service.register()
+        await dispatcher.start()
+        maintenance = MaintenanceService(database, clients, onboarding)
+        maintenance.start()
+
+        application = create_web_app(
+            settings, database, clients, onboarding, rclone, oauth, limiter
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                application,
+                host=settings.web_host,
+                port=settings.web_port,
+                log_level=settings.log_level.lower(),
+                proxy_headers=True,
+                forwarded_allow_ips="127.0.0.1",
+            )
+        )
+        LOG.info(
+            "Multi-user uploader started; web=%s:%s active_users=%s",
+            settings.web_host,
+            settings.web_port,
+            len(clients.list_active_clients()),
+        )
+        await server.serve()
+    finally:
+        if bot_service:
+            bot_service.accepting = False
+        if maintenance:
+            await maintenance.stop()
+        if onboarding:
+            await onboarding.shutdown()
+        if dispatcher:
+            await dispatcher.shutdown()
+        if rclone:
+            await rclone.shutdown()
+        if clients:
+            await clients.shutdown()
+        if bot:
+            await bot.disconnect()
+        await database.close()
 
 
 def main() -> None:
     try:
         asyncio.run(run())
-    except Exception as exc:
-        logging.critical("Startup failed: %s", exc)
-        raise SystemExit(1) from exc
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        logging.critical("Startup failed", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

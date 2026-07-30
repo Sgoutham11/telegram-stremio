@@ -6,17 +6,26 @@
 *.session-journal
 
 config/rclone/rclone.conf
+config/users/
 
 data/session/*
 data/downloads/*
 data/state/*
 data/logs/*
+data/users/
+data/pending-telegram/
+data/app.db
+data/app.db-shm
+data/app.db-wal
 
 !data/session/.gitkeep
 !data/downloads/.gitkeep
 !data/state/.gitkeep
 !data/logs/.gitkeep
 !config/rclone/.gitkeep
+
+output/
+tmp/
 
 *.tar
 *.tar.gz
