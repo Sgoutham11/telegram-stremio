@@ -125,11 +125,19 @@ class RcloneService:
             return False
 
     async def create_google_drive(
-        self, user_id: int, client_id: str, client_secret: str, token: dict[str, object]
+        self,
+        user_id: int,
+        remote: str,
+        client_id: str,
+        client_secret: str,
+        token: dict[str, object],
     ) -> str:
         config = self.config_path(user_id)
         config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        remote = self.settings.default_rclone_remote
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", remote):
+            raise ValueError("Invalid storage remote name")
+        if remote in await self.list_remotes(user_id):
+            raise ValueError("Storage remote already exists")
         code, _, error = await self._run(
             "rclone",
             "config",
@@ -154,11 +162,14 @@ class RcloneService:
         await self.validate_remote(user_id, remote)
         return remote
 
-    async def disconnect_storage(self, user_id: int) -> None:
+    async def disconnect_storage(self, user_id: int, remote: str) -> None:
         config = self.config_path(user_id)
         if not config.is_file():
             return
-        remote = self.settings.default_rclone_remote
+        try:
+            remote = await self.validate_remote(user_id, remote)
+        except ValueError:
+            return
         code, _, error = await self._run(
             "rclone",
             "config",

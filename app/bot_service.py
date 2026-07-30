@@ -252,10 +252,16 @@ class BotService:
                     )
         elif command in {"/remote", "/remotes"}:
             remotes = await self.rclone.list_remotes(user_id)
+            connections = await self.database.storage_connections(user_id)
+            accounts = {
+                row["remote_name"]: row["account_email"] or "unknown account"
+                for row in connections
+            }
             if command == "/remotes":
                 selected = user["selected_remote"] or "N/A"
                 rows = "\n".join(
-                    f"{index}. {name}" for index, name in enumerate(remotes, 1)
+                    f"{index}. {name} — {accounts.get(name, 'external config')}"
+                    for index, name in enumerate(remotes, 1)
                 )
                 await event.reply(
                     f"Available remotes:\n{rows or 'none'}\n\nCurrent remote: {selected}"

@@ -61,6 +61,7 @@ class Settings(BaseSettings):
 
     max_connected_users: int = Field(100, ge=1)
     max_pending_qr_logins: int = Field(10, ge=1)
+    multy_rclone_count: int = Field(2, ge=1, le=10)
     max_file_size_bytes: int = Field(0, ge=0)
     min_free_disk_bytes: int = Field(5 * 1024**3, ge=0)
     max_concurrent_user_workers: int = Field(2, ge=1, le=32)

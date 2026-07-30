@@ -1,30 +1,33 @@
 # Telegram Cloud Uploader
 
-A production-oriented, Dockerized Python 3.12 service that uses a normal Telegram account through Telethon/MTProto. Trusted users forward media into one configured private Telegram group; the service streams it to disk and transfers it to per-user directories on any rclone-supported cloud. Albums are handled consistently as one independent job per Telegram message while preserving `media_group_id` in state.
+A production-oriented, Dockerized Python 3.12 service in which users submit
+files privately to a Telegram bot, connect their own Telegram account and
+Google Drive, and upload into isolated per-user destinations. The service uses
+Telethon/MTProto for media transfer and rclone for verified cloud uploads.
 
 ## Architecture
 
-`Telethon event handler -> sender allowlist -> bounded asyncio queue -> download worker -> rclone copyto -> remote verification`. Each message has an atomic JSON state file in `/data/state`; downloads use isolated `/data/downloads/{chat_id}_{message_id}` directories. Per-user directory selections are atomically persisted in `/data/state/user_directories.json`, and per-user rclone selections in `/data/state/user_remotes.json`. No database or public port is used.
+`Telegram bot -> SQLite FIFO queue -> owner Telethon session -> download worker -> user's selected rclone remote -> remote verification`. Each Telegram user has an isolated session, download directory, storage configuration, and persistent destination preferences. The onboarding web service is bound to host loopback and is intended to be exposed through the existing HTTPS reverse proxy.
 
 ## Prerequisites
 
 - Docker Engine with Compose v2
 - A Telegram API ID/hash from [my.telegram.org](https://my.telegram.org)
-- An rclone remote
+- Google OAuth client credentials with the Drive API enabled
 - Enough local space for the largest file plus `MIN_FREE_DISK_GB`
 
 ## Configure
 
 ```bash
 cp .env.example .env
-mkdir -p data/downloads data/state data/session data/logs config/rclone
+mkdir -p data/users data/pending-telegram data/logs config/users
 ```
 
 PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
-New-Item -ItemType Directory -Force data/downloads,data/state,data/session,data/logs,config/rclone
+New-Item -ItemType Directory -Force data/users,data/pending-telegram,data/logs,config/users
 ```
 
 Put the API credentials from my.telegram.org in `.env`, set `WATCH_MODE=chat`, and set `WATCH_CHAT_ID` to the private group's numeric ID (commonly `-100...`). Configure trusted Telegram IDs and their cloud directory names as ordered lists:
@@ -61,37 +64,30 @@ The log block reports the chat ID for `WATCH_CHAT_ID`, sender ID for `ALLOWED_US
 
 Messages from users who are not listed in `ALLOWED_USER_IDS` are not processed. In the watched group, the service tells them to DM `@sgoutham11`. The service never sends this notice in unrelated chats or while Telegram ID discovery-only mode is active.
 
-## Configure rclone
+## Configure Google Drive storage
 
-Configure outside the service (Google Drive: choose `drive`, complete OAuth, select the appropriate scope):
-
-```bash
-docker run --rm -it -v "$(pwd)/config/rclone:/config/rclone" rclone/rclone config --config /config/rclone/rclone.conf
-```
-
-PowerShell:
-
-```powershell
-docker run --rm -it -v "${PWD}/config/rclone:/config/rclone" rclone/rclone config --config /config/rclone/rclone.conf
-```
-
-The same `rclone.conf` may contain multiple sections, for example `[gdrive]`, `[mega]`, and `[onedrive]`. Configure the default and Telegram-selectable allowlist:
+Set the Google OAuth client credentials and callback URL in `.env`. Users add
+their own Google Drives from the private `/connect` setup page; the service
+creates and maintains a separate rclone configuration for every Telegram user.
 
 ```env
+GOOGLE_CLIENT_ID=your-client-id
+GOOGLE_CLIENT_SECRET=your-client-secret
+GOOGLE_REDIRECT_URI=https://playbuddy.zapto.org/uploader/api/storage/google/callback
 DEFAULT_RCLONE_REMOTE=gdrive
-ALLOWED_RCLONE_REMOTES=gdrive,mega,onedrive
+MULTY_RCLONE_COUNT=2
 ```
 
-`DEFAULT_RCLONE_REMOTE` falls back to the legacy `RCLONE_REMOTE` when omitted. If `ALLOWED_RCLONE_REMOTES` is omitted, only the default is selectable. Matching is case-insensitive, but the spelling from `ALLOWED_RCLONE_REMOTES` is retained in state and paths. At startup the service uses `rclone listremotes` to ensure every allowed name exists in the mounted config; it does not contact the cloud merely to validate names.
+`MULTY_RCLONE_COUNT` is the maximum number of Google Drive connections each
+Telegram user may add. It defaults to `2` and accepts values from `1` through
+`10`. Every slot must use a different verified Google account. The Google
+account chooser is shown for every new connection, and the server rejects an
+account already connected by that Telegram user.
 
-Verify the mounted configuration:
-
-```bash
-docker compose -f docker-compose.prod.yml exec telegram-uploader \
-  rclone listremotes --config /config/rclone/rclone.conf
-```
-
-Google Drive, OneDrive, Dropbox, S3, B2, WebDAV, and other rclone backends work without provider-specific application code.
+The first Drive is named `gdrive`, the second `gdrive_02`, then `gdrive_03`,
+and so on. A newly connected Drive becomes the selected destination. Tokens
+and rclone configuration remain private under
+`/config/users/<telegram-user-id>/rclone.conf`.
 
 ## Local development
 
@@ -113,26 +109,22 @@ Users who do not want to build the image can download a prebuilt archive from th
 Download the matching image plus `docker-compose.prod.yml` and `env.example` from one release, then run:
 
 ```bash
-mkdir -p ~/telegram-uploader/{data/downloads,data/state,data/session,data/logs,config/rclone}
+mkdir -p ~/telegram-uploader/{data/users,data/pending-telegram,data/logs,config/users}
 cd ~/telegram-uploader
 mv env.example .env
 # Edit .env before continuing.
 docker load -i telegram-uploader-linux-amd64.tar.gz  # Use the arm64 file on ARM64.
 ```
 
-A first-time installation also needs an rclone configuration and Telegram login session:
+A first-time installation starts the service and then completes each user's
+Telegram and Google Drive connection through `/connect`:
 
 ```bash
-docker run --rm -it \
-  -v "$PWD/config/rclone:/config/rclone" \
-  rclone/rclone config --config /config/rclone/rclone.conf
-
-docker compose -f docker-compose.prod.yml run --rm telegram-uploader python -m app.auth
 docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml logs -f telegram-uploader
 ```
 
-For an update, preserve `.env`, `data/`, and `config/rclone/`; download and load the new image archive, replace `docker-compose.prod.yml`, and run `docker compose -f docker-compose.prod.yml up -d --force-recreate`.
+For an update, preserve `.env`, `data/`, and `config/users/`; download and load the new image archive, replace `docker-compose.prod.yml`, and run `docker compose -f docker-compose.prod.yml up -d --force-recreate`.
 
 To generate the standard Docker archive locally:
 
@@ -152,20 +144,20 @@ Production uses [docker-compose.prod.yml](docker-compose.prod.yml). Commits to `
 Prepare the Oracle server once:
 
 ```bash
-mkdir -p ~/telegram-uploader/{data/downloads,data/state,data/session,data/logs,config/rclone}
+mkdir -p ~/telegram-uploader/{data/users,data/pending-telegram,data/logs,config/users}
 cd ~/telegram-uploader
 # Create the private runtime files once. GitHub Actions does not replace them:
 cp .env.example .env
-# Authenticate once so data/session/telegram.session exists.
-# Configure rclone so config/rclone/rclone.conf exists.
+# Users create their Telegram and Drive connections through /connect.
 ```
 
 The server only needs the production Compose file and these persistent private assets:
 
 - `.env`
-- `data/session/telegram.session`
-- `config/rclone/rclone.conf`
-- the mounted `data/` directories for downloads, state, and logs
+- `data/app.db`
+- per-user Telegram sessions and downloads under `data/users/`
+- per-user rclone configurations under `config/users/`
+- the mounted `data/` directories for pending logins and logs
 
 Configure these GitHub repository settings under **Settings -> Secrets and variables -> Actions**:
 
@@ -173,7 +165,7 @@ Configure these GitHub repository settings under **Settings -> Secrets and varia
 - Secret `SSH_PRIVATE_KEY`: private key text used to connect to Oracle
 - Variable `SERVER_USER`: Oracle SSH user, such as `ubuntu`
 
-The workflow deploys only inside `~/telegram-uploader`. It replaces `telegram-uploader.tar` and `docker-compose.prod.yml`, loads the image, recreates the container, waits for it to become healthy, and removes the transferred archive. The server's `.env`, Telegram session, rclone configuration, downloads, state, and logs remain in their existing bind-mounted paths. Restrict the deploy key to this server and repository workflow.
+The workflow deploys only inside `~/telegram-uploader`. It replaces `telegram-uploader.tar` and `docker-compose.prod.yml`, loads the image, recreates the container, waits for it to become healthy, and removes the transferred archive. The server's `.env`, SQLite database, per-user Telegram sessions, per-user rclone configurations, downloads, and logs remain in their bind-mounted paths. Restrict the deploy key to this server and repository workflow.
 
 ### Sharing an existing HTTPS domain
 
@@ -255,16 +247,25 @@ Another configured user, such as `GALAXY`, has an independent selection under `U
 
 ## Per-user persistent rclone remotes
 
-Use `/remote` to show your current and available storage, `/remotes` to list the allowlist, and `/remote mega` to select another configured remote. Remote and directory selections are independent:
+Use `/remotes` to list connected Drives and their Google account emails,
+`/remote` to show the current destination, and `/remote gdrive_02` to select a
+different Drive:
 
 ```text
-/remote mega
+/remotes
+/remote gdrive_02
 /dir Movies
 Forward file
--> mega:UPLOADS/GOUTHAM/Movies/file.mkv
+-> gdrive_02:GOUTHAM/Movies/file.mkv
 ```
 
-Each allowed Telegram user has an independent selection. The remote is captured when a job is queued, so switching storage affects only later files; queued and active jobs keep their original destination. Selections survive restarts and redeployments through the mounted `/data/state/user_remotes.json`. A stored selection removed from `ALLOWED_RCLONE_REMOTES` safely falls back to `DEFAULT_RCLONE_REMOTE`.
+Each user has an independent set of connections and an independent selection.
+The selected remote is captured when a job is queued, so switching storage
+affects only future files; queued and active jobs keep their original
+destination. Connections and selections survive restarts through the mounted
+SQLite database and per-user rclone configuration. The setup page disconnects
+only the currently selected Drive and automatically selects another connected
+Drive when available.
 
 ## Commands
 
@@ -301,7 +302,14 @@ an older photograph cannot be accepted after its embedded token expires.
 
 ## Configuration reference
 
-`.env.example` is the authoritative full reference. `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` are ordered lists that define authorization and each user's top-level cloud directory. `DEFAULT_RCLONE_REMOTE` defines the fallback storage and `ALLOWED_RCLONE_REMOTES` defines the selectable names. `DEBUG_TELEGRAM_IDS=false` is the production-safe default and should be enabled only while discovering initial setup identifiers. Important controls also include `RCLONE_BASE_PATH`, `DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional size ceiling, progress interval, rclone retry/checker/transfer parameters, collision policy (`rename`, `overwrite`, `skip`), local cleanup/failed retention, interrupted-job retry, rotating logs, and optional public links. `REMOTE_FOLDER_PATTERN` is deprecated, retained only for environment compatibility, and has no effect; date folders are disabled. `MAX_FILE_SIZE_GB=0` disables the application ceiling.
+`.env.example` is the authoritative full reference.
+`DEFAULT_RCLONE_REMOTE` defines the base name for automatically created Drive
+remotes, while `MULTY_RCLONE_COUNT` limits how many different Google accounts
+each Telegram user can connect. Important controls also include
+`DEFAULT_UPLOAD_DIRECTORY`, queue/concurrency limits, disk reserve and optional
+size ceiling, progress interval, rclone retry/checker/transfer parameters,
+collision policy (`rename`, `overwrite`, `skip`), rotating logs, and local
+cleanup after successful uploads.
 
 `MAX_CONCURRENT_USER_WORKERS=2` allows two distinct users to process one file
 each in parallel, from Telegram download through cloud upload. A single user
@@ -333,16 +341,24 @@ Downloaded files are deleted after verified uploads when `DELETE_LOCAL_AFTER_SUC
 
 ## Security
 
-The container runs as non-root with all Linux capabilities dropped, exposes no ports, uses subprocess argument arrays (never a shell), and sanitizes filenames. Never commit `.env`, sessions, downloads, state, logs, or `rclone.conf`. The Telegram session grants account access: restrict its filesystem permissions, back it up encrypted, and revoke it from Telegram Active Sessions if exposed. Back up `data/session` and `config/rclone/rclone.conf` securely.
+The container runs as non-root with all Linux capabilities dropped, binds its
+web port only to host loopback, uses subprocess argument arrays (never a
+shell), and sanitizes filenames. Never commit `.env`, SQLite data, sessions,
+downloads, logs, or rclone configuration. Telegram sessions and Google OAuth
+tokens grant account access: restrict their filesystem permissions, back them
+up encrypted, and revoke exposed credentials immediately.
 
-`config/rclone` is intentionally mounted writable. OAuth remotes such as Google Drive refresh tokens and rclone persists them by creating a temporary file beside `rclone.conf` and atomically replacing the configuration. A read-only mount can make rclone retry an otherwise completed upload and create duplicate objects on providers that allow duplicate names. Restrict the host directory to the service account rather than mounting it read-only.
+`config/users` is intentionally mounted writable. Google Drive refresh tokens
+are stored in each user's rclone configuration, and rclone persists refreshed
+tokens by atomically replacing that file. A read-only mount can make an upload
+retry after its data was committed. Restrict the host directory to the service
+account rather than mounting it read-only.
 
 On Linux, prepare the mounted rclone configuration for container UID/GID `10001:10001`:
 
 ```bash
-sudo chown -R 10001:10001 config/rclone
-sudo chmod 700 config/rclone
-sudo chmod 600 config/rclone/rclone.conf
+sudo chown -R 10001:10001 config/users data
+sudo chmod 700 config/users data/users data/pending-telegram
 ```
 
 The application never changes these host permissions automatically.
@@ -361,10 +377,11 @@ docker compose up -d
 
 ## Troubleshooting
 
-- **Session missing/expired:** rerun the one-shot authentication command.
-- **Remote invalid/quota/permission:** run `rclone about REMOTE: --config config/rclone/rclone.conf` and inspect service logs.
-- **Allowed remote missing at startup:** compare `ALLOWED_RCLONE_REMOTES` with `rclone listremotes --config config/rclone/rclone.conf`; names must exist in the same mounted config.
-- **Rclone config read-only:** make `config/rclone` writable by container UID 10001. OAuth token refresh cannot work on a read-only mount.
+- **Telegram session missing/expired:** open `/connect` and reconnect that user's Telegram account.
+- **Remote invalid/quota/permission:** use `/remotes` to confirm the selected remote, then inspect the service logs.
+- **Duplicate Google account:** choose a different Google account; one account cannot occupy two Drive slots for the same Telegram user.
+- **Older connection has no account identity:** disconnect and reconnect that Drive once, then add the next Drive.
+- **Rclone config read-only:** make `config/users` writable by container UID 10001. OAuth token refresh cannot work on a read-only mount.
 - **Unhealthy container:** inspect `/data/state/health.json`, `docker compose ps`, and logs.
 - **Message ignored:** confirm `WATCH_MODE=chat`, the private `WATCH_CHAT_ID`, and that the sender has a position-matched entry in both allowed-user lists.
 - **Startup mapping error:** ensure `ALLOWED_USER_IDS` and `ALLOWED_USER_NAME` have the same number of unique comma-separated entries.
