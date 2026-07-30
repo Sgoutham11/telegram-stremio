@@ -21,7 +21,7 @@ if (new URLSearchParams(window.location.search).get("storage") === "failed") {
 
 async function refresh() {
   try {
-    const status = await api("/api/status");
+    const status = await api("api/status");
     $("telegram-status").textContent = status.telegram.connected
       ? `Connected as: ${status.telegram.displayName}` : "Not connected";
     $("telegram-connect").hidden = status.telegram.connected;
@@ -54,11 +54,11 @@ function applyLogin(login) {
 $("telegram-connect").addEventListener("click", async () => {
   notice();
   try {
-    const login = await api("/api/telegram/connect/start", {method: "POST"});
+    const login = await api("api/telegram/connect/start", {method: "POST"});
     applyLogin(login);
     clearInterval(pollTimer);
     pollTimer = setInterval(async () => {
-      try { applyLogin(await api(`/api/telegram/connect/status/${connectionId}`)); }
+      try { applyLogin(await api(`api/telegram/connect/status/${connectionId}`)); }
       catch (error) { notice(error.message); clearInterval(pollTimer); }
     }, 2000);
   } catch (error) { notice(error.message); }
@@ -69,7 +69,7 @@ $("two-factor").addEventListener("submit", async (event) => {
   const password = $("two-factor-password").value;
   $("two-factor-password").value = "";
   try {
-    applyLogin(await api("/api/telegram/connect/2fa", {
+    applyLogin(await api("api/telegram/connect/2fa", {
       method: "POST",
       body: JSON.stringify({connectionId, password})
     }));
@@ -78,7 +78,7 @@ $("two-factor").addEventListener("submit", async (event) => {
 
 async function disconnectTelegram(action) {
   try {
-    await api("/api/telegram/disconnect", {
+    await api("api/telegram/disconnect", {
       method: "POST", body: JSON.stringify({action})
     });
     await refresh();
@@ -88,11 +88,11 @@ async function disconnectTelegram(action) {
 $("telegram-disconnect").addEventListener("click", () => disconnectTelegram("local"));
 $("telegram-revoke").addEventListener("click", () => disconnectTelegram("revoke"));
 $("storage-connect").addEventListener("click", () => {
-  window.location.assign("/api/storage/google/connect");
+  window.location.assign("api/storage/google/connect");
 });
 $("storage-disconnect").addEventListener("click", async () => {
   try {
-    await api("/api/storage/google/disconnect", {method: "POST"});
+    await api("api/storage/google/disconnect", {method: "POST"});
     await refresh();
   } catch (error) { notice(error.message); }
 });
