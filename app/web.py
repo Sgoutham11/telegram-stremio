@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from .client_manager import TelegramClientManager
 from .config import Settings
 from .database import Database
-from .oauth_service import GoogleOAuthService
+from .oauth_service import GoogleOAuthService, StorageConnectionError
 from .rclone_service import RcloneService
 from .security import RateLimiter, expires_at, random_token, resolve_web_user, token_hash
 from .telegram_onboarding import TelegramOnboardingManager
@@ -26,6 +26,10 @@ class TwoFactorRequest(BaseModel):
 
 class TelegramDisconnectRequest(BaseModel):
     action: Literal["local", "revoke"] = "local"
+
+
+class StorageDisconnectRequest(BaseModel):
+    remote: str | None = Field(default=None, max_length=100)
 
 
 def create_web_app(
@@ -113,6 +117,11 @@ def create_web_app(
             and selected_remote
             and await rclone.verify_connection(user_id, str(selected_remote))
         )
+        connections = [
+            row
+            for row in await database.storage_connections(user_id)
+            if row["provider"] == "google"
+        ]
         return {
             "telegram": {
                 "connected": bool(user["telegram_connected"]),
@@ -121,7 +130,18 @@ def create_web_app(
             "storage": {
                 "connected": storage_verified,
                 "provider": "Google Drive" if storage_verified else None,
-                "remote": selected_remote if storage_verified else None,
+                "remote": selected_remote,
+                "connections": [
+                    {
+                        "remote": row["remote_name"],
+                        "email": row["account_email"],
+                        "selected": row["remote_name"] == selected_remote,
+                    }
+                    for row in connections
+                ],
+                "count": len(connections),
+                "limit": settings.multy_rclone_count,
+                "canAdd": len(connections) < settings.multy_rclone_count,
             },
             "active": bool(
                 user["active"]
@@ -205,6 +225,10 @@ def create_web_app(
         limiter.check("oauth-start", str(user_id), 5, 600)
         try:
             url = await oauth.authorization_url(user_id, web_digest)
+        except StorageConnectionError as exc:
+            return RedirectResponse(
+                f"{public_index}?storage={exc.code}", status_code=303
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from None
         return RedirectResponse(url)
@@ -218,6 +242,10 @@ def create_web_app(
             owner = await oauth.complete(code, state, web_digest)
         except PermissionError:
             raise HTTPException(status_code=403, detail="Invalid OAuth state") from None
+        except StorageConnectionError as exc:
+            return RedirectResponse(
+                f"{public_index}?storage={exc.code}", status_code=303
+            )
         except Exception:
             return RedirectResponse(
                 f"{public_index}?storage=failed", status_code=303
@@ -229,26 +257,47 @@ def create_web_app(
         )
 
     @app.post("/api/storage/google/disconnect")
-    async def disconnect_google(request: Request) -> dict[str, str]:
+    async def disconnect_google(
+        payload: StorageDisconnectRequest, request: Request
+    ) -> dict[str, str]:
         user, _ = await session(request)
         user_id = int(user["telegram_user_id"])
         limiter.check("storage-disconnect", str(user_id), 3, 600)
-        await rclone.disconnect_storage(user_id)
+        remote = (payload.remote or user["selected_remote"] or "").strip()
+        connections = [
+            row
+            for row in await database.storage_connections(user_id)
+            if row["provider"] == "google"
+        ]
+        connection = next(
+            (row for row in connections if row["remote_name"] == remote),
+            None,
+        )
+        if not connection:
+            raise HTTPException(status_code=404, detail="Storage remote not found")
+        await rclone.disconnect_storage(user_id, remote)
         await database.execute(
             """
-            UPDATE storage_connections
-            SET connected=0, updated_at=?
-            WHERE telegram_user_id=? AND provider='google'
+            DELETE FROM storage_connections
+            WHERE telegram_user_id=? AND provider='google' AND remote_name=?
             """,
-            (datetime.now(timezone.utc).isoformat(), user_id),
+            (user_id, remote),
+        )
+        remaining = await database.storage_connections(user_id)
+        selected_remote = (
+            user["selected_remote"]
+            if any(row["remote_name"] == user["selected_remote"] for row in remaining)
+            else (remaining[0]["remote_name"] if remaining else None)
         )
         await database.set_user_fields(
             user_id,
-            storage_connected=0,
-            rclone_config_path=None,
-            selected_remote=None,
+            storage_connected=1 if remaining else 0,
+            rclone_config_path=(
+                str(settings.user_rclone_config(user_id)) if remaining else None
+            ),
+            selected_remote=selected_remote,
         )
-        return {"status": "DISCONNECTED"}
+        return {"status": "DISCONNECTED", "remote": remote}
 
     @app.get("/healthz")
     async def health() -> JSONResponse:

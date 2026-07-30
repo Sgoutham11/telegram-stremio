@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 let connectionId = null;
 let pollTimer = null;
+let selectedRemote = null;
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
@@ -15,8 +16,19 @@ async function api(url, options = {}) {
 
 function notice(message = "") { $("notice").textContent = message; }
 
-if (new URLSearchParams(window.location.search).get("storage") === "failed") {
+const storageResult = new URLSearchParams(window.location.search).get("storage");
+if (storageResult === "failed") {
   notice("Google Drive authorization was not completed or Drive access could not be verified.");
+} else if (storageResult === "duplicate") {
+  notice("That Google account is already connected. Choose a different account.");
+} else if (storageResult === "limit") {
+  notice("You have reached the Google Drive connection limit.");
+} else if (storageResult === "identity") {
+  notice("Google did not return a verified account email.");
+} else if (storageResult === "legacy") {
+  notice("Disconnect and reconnect the existing Google Drive once before adding another.");
+} else if (storageResult === "connected") {
+  notice("Google Drive connected.");
 }
 
 async function refresh() {
@@ -26,10 +38,20 @@ async function refresh() {
       ? `Connected as: ${status.telegram.displayName}` : "Not connected";
     $("telegram-connect").hidden = status.telegram.connected;
     $("telegram-disconnect-actions").hidden = !status.telegram.connected;
-    $("storage-status").textContent = status.storage.connected
-      ? `${status.storage.provider} connected` : "Not connected";
-    $("storage-connect").hidden = status.storage.connected;
-    $("storage-disconnect").hidden = !status.storage.connected;
+    selectedRemote = status.storage.remote;
+    $("storage-status").textContent =
+      `${status.storage.count} of ${status.storage.limit} Google Drives connected`;
+    const list = $("storage-connections");
+    list.replaceChildren();
+    for (const connection of status.storage.connections) {
+      const item = document.createElement("li");
+      item.textContent =
+        `${connection.remote} — ${connection.email || "unknown account"}`
+        + (connection.selected ? " (selected)" : "");
+      list.appendChild(item);
+    }
+    $("storage-connect").hidden = !status.storage.canAdd;
+    $("storage-disconnect").hidden = !selectedRemote;
     $("active-panel").hidden = !status.active;
   } catch (error) {
     notice(error.message);
@@ -92,7 +114,11 @@ $("storage-connect").addEventListener("click", () => {
 });
 $("storage-disconnect").addEventListener("click", async () => {
   try {
-    await api("api/storage/google/disconnect", {method: "POST"});
+    await api("api/storage/google/disconnect", {
+      method: "POST",
+      body: JSON.stringify({remote: selectedRemote})
+    });
+    selectedRemote = null;
     await refresh();
   } catch (error) { notice(error.message); }
 });

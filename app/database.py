@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS storage_connections (
     telegram_user_id INTEGER NOT NULL,
     provider TEXT NOT NULL,
     remote_name TEXT NOT NULL,
+    provider_account_id TEXT,
+    account_email TEXT,
     config_path TEXT NOT NULL,
     connected INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -186,6 +188,39 @@ class Database:
             await self._db().execute(
                 "ALTER TABLE upload_jobs ADD COLUMN source_message_id INTEGER"
             )
+        storage_columns = {
+            row["name"]
+            for row in await (
+                await self._db().execute("PRAGMA table_info(storage_connections)")
+            ).fetchall()
+        }
+        if "provider_account_id" not in storage_columns:
+            await self._db().execute(
+                "ALTER TABLE storage_connections "
+                "ADD COLUMN provider_account_id TEXT"
+            )
+        if "account_email" not in storage_columns:
+            await self._db().execute(
+                "ALTER TABLE storage_connections ADD COLUMN account_email TEXT"
+            )
+        await self._db().execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_provider_account
+            ON storage_connections(
+                telegram_user_id, provider, provider_account_id
+            )
+            WHERE provider_account_id IS NOT NULL
+            """
+        )
+        await self._db().execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_storage_account_email
+            ON storage_connections(
+                telegram_user_id, provider, account_email
+            )
+            WHERE account_email IS NOT NULL
+            """
+        )
 
     async def close(self) -> None:
         if self.connection is not None:
@@ -296,6 +331,23 @@ class Database:
     async def connected_users(self) -> list[dict[str, Any]]:
         return await self.fetchall(
             "SELECT * FROM users WHERE telegram_connected=1 AND active=1"
+        )
+
+    async def storage_connections(
+        self, user_id: int, connected_only: bool = True
+    ) -> list[dict[str, Any]]:
+        connected = "AND connected=1" if connected_only else ""
+        return await self.fetchall(
+            f"""
+            SELECT
+                id, telegram_user_id, provider, remote_name,
+                provider_account_id, account_email, connected,
+                created_at, updated_at
+            FROM storage_connections
+            WHERE telegram_user_id=? {connected}
+            ORDER BY created_at, id
+            """,
+            (user_id,),
         )
 
     async def admin_user_report(self, user_id: int | None = None) -> list[dict[str, Any]]:
