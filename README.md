@@ -208,6 +208,7 @@ All supported interaction occurs in a private conversation with the bot.
 | --- | --- |
 | `/start` | Register or refresh the private user record. |
 | `/connect` | Create a single-use link for connecting or managing Telegram and Google Drive. |
+| `/clear` | Cancel current work and remove your Telegram session, Google Drive connections, setup sessions, and local per-user files. You may connect again later. |
 | `/tutorial` | Send the illustrated setup and playback guide. This also works before registration. |
 | `/status` | Show live Telegram/Drive connection state, destination preferences, and job counts. |
 | `/cancel [job-id]` | Cancel the specified owned job, or the user's oldest active/queued job when no ID is supplied. |
@@ -224,8 +225,10 @@ All supported interaction occurs in a private conversation with the bot.
 
 ### Administrator commands
 
-Set `ADMIN_TELEGRAM_USER_ID` to one numeric Telegram user ID to enable read-only
-operational reports for that account:
+Set `ADMIN_TELEGRAM_USER_ID` to one numeric Telegram user ID to enable
+administration commands for that account. Blocked-user replies use the stored
+Telegram username of that administrator. `ADMIN_CONTACT` can optionally
+override it, for example with `@adminusername`.
 
 | Command | Description |
 | --- | --- |
@@ -234,6 +237,9 @@ operational reports for that account:
 | `/db activeworks` | Show queued, downloading, downloaded, and uploading jobs. |
 | `/db stats` | Show user totals and job totals grouped by status. |
 | `/db failed [limit]` | Show recent failed jobs; the default is 10 and the maximum is 50. |
+| `/clear <user-id>` | Cancel work and remove a user's Telegram, Drive, onboarding, and local connection data without blocking future access. |
+| `/block <user-id>` | Perform the same cleanup and prevent the user from using the bot or onboarding page. |
+| `/unblock <user-id>` | Restore access. The user must run `/start` and `/connect` to establish new connections. |
 
 These reports do not expose session paths, OAuth state, onboarding tokens,
 rclone credentials, or Google tokens.
@@ -273,11 +279,14 @@ control the bot.
 1. Create or select a project in Google Cloud Console.
 2. Enable the Google Drive API.
 3. Configure the OAuth consent screen.
-4. If the app remains in testing mode, add every intended Google account as a
+4. Under **Google Auth Platform -> Data Access**, add only the Google Drive
+   scope `https://www.googleapis.com/auth/drive.file`. Do not add the broader
+   `https://www.googleapis.com/auth/drive` scope.
+5. If the app remains in testing mode, add every intended Google account as a
    test user.
-5. Create an OAuth client with application type **Web application**.
-6. Add the exact callback used by this service as an authorized redirect URI.
-7. Copy the client ID and secret into `GOOGLE_CLIENT_ID` and
+6. Create an OAuth client with application type **Web application**.
+7. Add the exact callback used by this service as an authorized redirect URI.
+8. Copy the client ID and secret into `GOOGLE_CLIENT_ID` and
    `GOOGLE_CLIENT_SECRET`.
 
 Examples:
@@ -297,9 +306,15 @@ The value registered in Google Cloud must exactly match
 `GOOGLE_REDIRECT_URI`, including scheme, hostname, path, case, and trailing
 slash behavior.
 
-The service requests OpenID identity/email scopes and Google Drive access. It
-uses the verified Google account identity to prevent the same user from adding
-one Google account more than once.
+The service requests OpenID identity/email scopes and the narrower Google Drive
+`drive.file` scope. Drive access is limited to files and folders created by, or
+explicitly opened with, this application. The verified Google account identity
+prevents the same user from adding one Google account more than once.
+
+Connections created with an earlier full-Drive scope are not deleted
+automatically. Each affected user must disconnect and reconnect Google Drive so
+Google can grant the new permission. The application reports: **Google Drive
+permissions have changed. Please disconnect and reconnect Google Drive.**
 
 ## Local development
 
@@ -640,8 +655,8 @@ control at a time and measure the result.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ADMIN_TELEGRAM_USER_ID` | empty | Numeric account allowed to run `/db` commands; empty disables them. |
-| `ADMIN_CONTACT` | empty | Reserved compatibility value; the current command flow does not read it. |
+| `ADMIN_TELEGRAM_USER_ID` | empty | Numeric account allowed to run private administration commands; empty disables them. |
+| `ADMIN_CONTACT` | empty | Optional blocked-user contact override. When empty, the administrator's stored Telegram username is used. |
 | `LOG_LEVEL` | `INFO` | Python log level. |
 | `LOG_FILE` | `/data/logs/uploader.log` | Rotating file log. |
 | `LOG_MAX_BYTES` | `10485760` | Maximum bytes per log file. |

@@ -94,6 +94,13 @@ class TelegramClientManager:
             user_id = int(user["telegram_user_id"])
             try:
                 await self.start_user(user_id)
+            except (FileNotFoundError, PermissionError):
+                LOG.exception(
+                    "Telegram session requires reconnection for user %s", user_id
+                )
+                await self.database.set_user_fields(
+                    user_id, telegram_connected=0, session_path=None
+                )
             except Exception:
                 LOG.exception("Unable to start Telegram session for user %s", user_id)
 

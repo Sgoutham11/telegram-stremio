@@ -517,6 +517,34 @@ class TelegramOnboardingManager:
             ):
                 await self._expire(pending)
 
+    async def clear_user(self, user_id: int) -> None:
+        """Cancel and remove every pending login for one user."""
+        async with self._lock:
+            pending_logins = [
+                pending
+                for pending in self._pending.values()
+                if pending.user_id == int(user_id)
+            ]
+            for pending in pending_logins:
+                self._pending.pop(pending.connection_id, None)
+        tasks = []
+        for pending in pending_logins:
+            if pending.task and pending.task is not asyncio.current_task():
+                pending.task.cancel()
+                tasks.append(pending.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for pending in pending_logins:
+            try:
+                await pending.client.disconnect()
+            except Exception:
+                LOG.debug(
+                    "Unable to disconnect cleared Telegram login %s",
+                    pending.connection_id,
+                    exc_info=True,
+                )
+            shutil.rmtree(pending.session_path.parent, ignore_errors=True)
+
     async def shutdown(self) -> None:
         self.accepting = False
         pending = list(self._pending.values())

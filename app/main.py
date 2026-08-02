@@ -22,6 +22,19 @@ from .web import create_web_app
 LOG = logging.getLogger(__name__)
 
 
+def create_server(application: object, settings: Settings) -> uvicorn.Server:
+    return uvicorn.Server(
+        uvicorn.Config(
+            application,
+            host=settings.web_host,
+            port=settings.web_port,
+            log_level=settings.log_level.lower(),
+            proxy_headers=True,
+            forwarded_allow_ips="127.0.0.1",
+        )
+    )
+
+
 async def run() -> None:
     settings = Settings()
     settings.prepare_directories()
@@ -70,7 +83,14 @@ async def run() -> None:
             settings, database, clients, rclone, bot, int(bot_identity.id)
         )
         bot_service = BotService(
-            bot, settings, database, clients, rclone, dispatcher, limiter
+            bot,
+            settings,
+            database,
+            clients,
+            rclone,
+            dispatcher,
+            limiter,
+            onboarding=onboarding,
         )
         bot_service.register()
         await dispatcher.start()
@@ -80,16 +100,7 @@ async def run() -> None:
         application = create_web_app(
             settings, database, clients, onboarding, rclone, oauth, limiter
         )
-        server = uvicorn.Server(
-            uvicorn.Config(
-                application,
-                host=settings.web_host,
-                port=settings.web_port,
-                log_level=settings.log_level.lower(),
-                proxy_headers=True,
-                forwarded_allow_ips="127.0.0.1",
-            )
-        )
+        server = create_server(application, settings)
         LOG.info(
             "Multi-user uploader started; web=%s:%s active_users=%s",
             settings.web_host,

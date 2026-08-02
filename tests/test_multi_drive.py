@@ -12,6 +12,7 @@ class FakeRclone:
     def __init__(self):
         self.remotes: dict[int, list[str]] = {}
         self.identities: dict[tuple[int, str], tuple[str, str]] = {}
+        self.current_scopes: set[tuple[int, str]] = set()
         self.created: list[tuple[int, str]] = []
         self.deleted: list[tuple[int, str]] = []
 
@@ -22,6 +23,7 @@ class FakeRclone:
         self, user_id, remote, _client_id, _client_secret, _token
     ):
         self.remotes.setdefault(user_id, []).append(remote)
+        self.current_scopes.add((user_id, remote))
         self.created.append((user_id, remote))
         return remote
 
@@ -31,8 +33,12 @@ class FakeRclone:
     async def google_drive_identity(self, user_id, remote):
         return self.identities.get((user_id, remote))
 
+    def uses_required_google_drive_scope(self, user_id, remote):
+        return (user_id, remote) in self.current_scopes
+
     async def disconnect_storage(self, user_id, remote):
         self.remotes.setdefault(user_id, []).remove(remote)
+        self.current_scopes.discard((user_id, remote))
         self.deleted.append((user_id, remote))
 
 
@@ -71,6 +77,13 @@ async def test_two_distinct_google_accounts_create_two_selectable_remotes(
     first_query = parse_qs(urlsplit(first_url).query)
     assert "openid" in first_query["scope"][0].split()
     assert "email" in first_query["scope"][0].split()
+    assert "https://www.googleapis.com/auth/drive.file" in first_query[
+        "scope"
+    ][0].split()
+    assert "https://www.googleapis.com/auth/drive" not in first_query[
+        "scope"
+    ][0].split()
+    assert first_query["include_granted_scopes"] == ["false"]
     assert first_query["prompt"] == ["select_account consent"]
     assert await service.complete("code-1", first_state, "browser-session") == 10
 
@@ -147,7 +160,7 @@ async def test_unverified_google_email_is_rejected_before_rclone_creation(
     assert rclone.created == []
 
 
-async def test_legacy_connection_identity_is_recovered_without_reconnecting(
+async def test_legacy_connection_requires_disconnect_and_reconnect(
     settings, database
 ):
     settings.multy_rclone_count = 2
@@ -163,15 +176,14 @@ async def test_legacy_connection_identity_is_recovered_without_reconnecting(
     )
     rclone = FakeRclone()
     rclone.remotes[10] = ["gdrive"]
-    rclone.identities[(10, "gdrive")] = (
-        "legacy-google-account",
-        "legacy@gmail.com",
-    )
     service = GoogleOAuthService(settings, database, rclone)
 
-    url = await service.authorization_url(10, "browser-session")
+    with pytest.raises(StorageConnectionError) as raised:
+        await service.authorization_url(10, "browser-session")
 
-    assert url.startswith(service.AUTHORIZATION_ENDPOINT)
-    connection = (await database.storage_connections(10))[0]
-    assert connection["provider_account_id"] == "legacy-google-account"
-    assert connection["account_email"] == "legacy@gmail.com"
+    assert raised.value.code == "permissions"
+    assert str(raised.value) == (
+        "Google Drive permissions have changed. Please disconnect and reconnect "
+        "Google Drive."
+    )
+    assert rclone.deleted == []

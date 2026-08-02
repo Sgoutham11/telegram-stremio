@@ -18,17 +18,23 @@ async function api(url, options = {}) {
   return body;
 }
 
-function notice(message = "") { $("notice").textContent = message; }
+function notice(message = "", type = "info") {
+  const element = $("notice");
+  element.textContent = message;
+  element.classList.toggle("error", Boolean(message) && type === "error");
+}
 
 const storageResult = new URLSearchParams(window.location.search).get("storage");
 if (storageResult === "failed") {
-  notice("Google Drive authorization was not completed or Drive access could not be verified.");
+  notice("Google Drive authorization was not completed or Drive access could not be verified.", "error");
 } else if (storageResult === "duplicate") {
-  notice("That Google account is already connected. Choose a different account.");
+  notice("That Google account is already connected. Choose a different account.", "error");
 } else if (storageResult === "limit") {
-  notice("You have reached the Google Drive connection limit.");
+  notice("You have reached the Google Drive connection limit.", "error");
 } else if (storageResult === "identity") {
-  notice("Google did not return a verified account email.");
+  notice("Google did not return a verified account email.", "error");
+} else if (storageResult === "permissions") {
+  notice("Google Drive permissions have changed. Please disconnect and reconnect Google Drive.", "error");
 } else if (storageResult === "connected") {
   notice("Google Drive connected.");
 }
@@ -56,7 +62,7 @@ async function refresh() {
     $("storage-disconnect").hidden = !selectedRemote;
     $("active-panel").hidden = !status.active;
   } catch (error) {
-    notice(error.message);
+    notice(error.message, "error");
   }
 }
 
@@ -68,7 +74,14 @@ function applyLogin(login) {
   $("phone-code").hidden = login.status !== "WAITING_FOR_CODE";
   $("two-factor").hidden = login.status !== "TWO_FACTOR_REQUIRED";
   if (login.qrImage) $("qr-image").src = login.qrImage;
-  if (login.message) notice(login.message);
+  if (login.message) {
+    const loginError = ["FAILED", "EXPIRED"].includes(login.status)
+      || /^(incorrect|invalid|unable|this .* expired|telegram rate limited|telegram has restricted|enter a valid|no telegram account)/i.test(login.message);
+    notice(
+      login.message,
+      loginError ? "error" : "info"
+    );
+  }
   if (login.status === "CONNECTED") {
     clearInterval(pollTimer);
     $("qr-panel").hidden = true;
@@ -86,7 +99,7 @@ function startLoginPolling() {
   clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
     try { applyLogin(await api(`api/telegram/connect/status/${connectionId}`)); }
-    catch (error) { notice(error.message); clearInterval(pollTimer); }
+    catch (error) { notice(error.message, "error"); clearInterval(pollTimer); }
   }, 2000);
 }
 
@@ -109,7 +122,7 @@ $("telegram-connect-qr").addEventListener("click", async () => {
     applyLogin(login);
     startLoginPolling();
   } catch (error) {
-    notice(error.message);
+    notice(error.message, "error");
     $("telegram-connect").hidden = false;
   }
 });
@@ -126,7 +139,7 @@ $("phone-start").addEventListener("submit", async (event) => {
     applyLogin(login);
     if (!["FAILED", "EXPIRED"].includes(login.status)) startLoginPolling();
   } catch (error) {
-    notice(error.message);
+    notice(error.message, "error");
     $("phone-start").hidden = false;
   }
 });
@@ -140,7 +153,7 @@ $("phone-code").addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({connectionId, code})
     }));
-  } catch (error) { notice(error.message); }
+  } catch (error) { notice(error.message, "error"); }
 });
 
 $("two-factor").addEventListener("submit", async (event) => {
@@ -152,7 +165,7 @@ $("two-factor").addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({connectionId, password})
     }));
-  } catch (error) { notice(error.message); }
+  } catch (error) { notice(error.message, "error"); }
 });
 
 async function disconnectTelegram(action) {
@@ -161,7 +174,7 @@ async function disconnectTelegram(action) {
       method: "POST", body: JSON.stringify({action})
     });
     await refresh();
-  } catch (error) { notice(error.message); }
+  } catch (error) { notice(error.message, "error"); }
 }
 
 $("telegram-disconnect").addEventListener("click", () => disconnectTelegram("local"));
@@ -177,7 +190,7 @@ $("storage-disconnect").addEventListener("click", async () => {
     });
     selectedRemote = null;
     await refresh();
-  } catch (error) { notice(error.message); }
+  } catch (error) { notice(error.message, "error"); }
 });
 
 refresh();

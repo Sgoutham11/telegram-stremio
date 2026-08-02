@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ class BotService:
         rclone: RcloneService,
         dispatcher: JobDispatcher,
         limiter: RateLimiter,
+        onboarding: Any | None = None,
     ):
         self.bot = bot
         self.settings = settings
@@ -49,6 +51,7 @@ class BotService:
         self.rclone = rclone
         self.dispatcher = dispatcher
         self.limiter = limiter
+        self.onboarding = onboarding
         self.accepting = True
 
     def register(self) -> None:
@@ -62,6 +65,10 @@ class BotService:
             user_id = int(sender.id)
             text = (event.raw_text or "").strip()
             try:
+                user = await self.database.get_user(user_id)
+                if user and not user["active"] and not self._is_admin(user_id):
+                    await event.reply(await self._blocked_message())
+                    return
                 if text.startswith("/"):
                     await self._handle_command(event, sender, text)
                 elif getattr(event.message, "media", None):
@@ -78,6 +85,15 @@ class BotService:
         argument = arguments[0].strip() if arguments else ""
         user_id = int(sender.id)
         self.limiter.check(f"bot:{command}", str(user_id), 12, 60)
+
+        existing_user = await self.database.get_user(user_id)
+        if (
+            existing_user
+            and not existing_user["active"]
+            and not self._is_admin(user_id)
+        ):
+            await event.reply(await self._blocked_message())
+            return
 
         if command == "/ls":
             await event.reply(self._command_list(self._is_admin(user_id)))
@@ -108,6 +124,65 @@ class BotService:
         user = await self.database.get_user(user_id)
         if not user:
             await event.reply("Send /start before using this command.")
+            return
+        if command == "/clear":
+            target_id = user_id
+            if argument:
+                if not self._is_admin(user_id):
+                    await event.reply(
+                        "Only the administrator can clear another user."
+                    )
+                    return
+                if not argument.isdigit() or int(argument) <= 0:
+                    await event.reply("Usage: /clear <user-id>")
+                    return
+                target_id = int(argument)
+            if not await self._clear_user_access(target_id):
+                await event.reply("User not found.")
+                return
+            if target_id == user_id:
+                await event.reply(
+                    "Your Telegram and Google Drive connections were cleared. "
+                    "Use /connect when you want to connect again."
+                )
+            else:
+                await event.reply(
+                    f"User {target_id} was cleared and may connect again."
+                )
+            return
+        if command in {"/block", "/unblock"}:
+            if not self._is_admin(user_id):
+                await event.reply(
+                    "This command is available only to the administrator."
+                )
+                return
+            if not argument.isdigit() or int(argument) <= 0:
+                await event.reply(f"Usage: {command} <user-id>")
+                return
+            target_id = int(argument)
+            if target_id == user_id and command == "/block":
+                await event.reply("The administrator account cannot block itself.")
+                return
+            target = await self.database.get_user(target_id)
+            if command == "/block":
+                if not target:
+                    await self.database.ensure_user(
+                        target_id,
+                        target_id,
+                        self.settings.default_upload_directory,
+                    )
+                await self._clear_user_access(target_id, active=False)
+                await event.reply(
+                    f"User {target_id} was cleared and blocked."
+                )
+            elif not target:
+                await event.reply("User not found.")
+            else:
+                await self.database.set_user_fields(target_id, active=1)
+                await event.reply(
+                    f"User {target_id} was unblocked and may use /start and "
+                    "/connect again."
+                )
             return
         selected_root = user["selected_root_directory"] or default_root_directory(
             user["first_name"], user["last_name"], user_id
@@ -321,6 +396,7 @@ class BotService:
             "Commands available to you:",
             "/start - register this private chat",
             "/connect - open or manage secure onboarding",
+            "/clear - remove your Telegram and Google Drive connections",
             "/tutorial - show setup and playback guide",
             "/status - show your connections and jobs",
             "/cancel [job-id] - cancel your job",
@@ -341,9 +417,63 @@ class BotService:
                     "/db activeworks - show queued and processing jobs",
                     "/db stats - show user and job totals by status",
                     "/db failed [limit] - show recent failed jobs (default 10)",
+                    "/clear <user-id> - clear a user's connections without blocking",
+                    "/block <user-id> - clear and block a user",
+                    "/unblock <user-id> - allow a blocked user to connect again",
                 ]
             )
         return "\n".join(commands)
+
+    async def _blocked_message(self) -> str:
+        contact = self.settings.admin_contact.strip()
+        if not contact and self.settings.admin_telegram_user_id is not None:
+            admin = await self.database.get_user(
+                self.settings.admin_telegram_user_id
+            )
+            if admin and admin["username"]:
+                contact = f"@{admin['username']}"
+            else:
+                contact = str(self.settings.admin_telegram_user_id)
+        if contact:
+            return f"You are blocked. Contact admin {contact} for more details."
+        return "You are blocked. Contact the administrator for more details."
+
+    async def _clear_user_access(
+        self, user_id: int, active: bool | None = None
+    ) -> bool:
+        if not await self.database.get_user(user_id):
+            return False
+        pending = await self.database.fetchall(
+            """
+            SELECT temporary_session_path FROM telegram_login_sessions
+            WHERE telegram_user_id=?
+            """,
+            (user_id,),
+        )
+        await self.dispatcher.cancel_all(user_id)
+        if self.onboarding is not None:
+            await self.onboarding.clear_user(user_id)
+        await self.clients.stop_user(user_id)
+        shutil.rmtree(self.settings.user_data_dir(user_id), ignore_errors=True)
+        shutil.rmtree(
+            self.settings.user_rclone_config(user_id).parent, ignore_errors=True
+        )
+        pending_root = self.settings.pending_telegram_root.resolve()
+        for row in pending:
+            path = Path(row["temporary_session_path"]).parent
+            try:
+                resolved = path.resolve()
+                if resolved.is_relative_to(pending_root):
+                    shutil.rmtree(resolved, ignore_errors=True)
+            except OSError:
+                LOG.warning(
+                    "Unable to clear pending Telegram path for user %s", user_id
+                )
+        return await self.database.clear_user_access(
+            user_id,
+            self.settings.default_upload_directory,
+            active=active,
+        )
 
     async def _handle_admin_database_command(
         self, event: Any, argument: str
@@ -451,6 +581,7 @@ class BotService:
             f"Name: {row['first_name'] or 'N/A'} {row['last_name'] or ''}".rstrip()
             + "\n"
             f"Enabled: {'yes' if row['active'] else 'no'}\n"
+            f"Blocked: {'no' if row['active'] else 'yes'}\n"
             f"Telegram: {'connected' if row['telegram_connected'] else 'not connected'}\n"
             f"Storage: {'connected' if row['storage_connected'] else 'not connected'}\n"
             f"Remote: {row['selected_remote'] or 'N/A'}\n"
@@ -534,8 +665,8 @@ class BotService:
             return
         if not await self.rclone.verify_connection(user_id, selected_remote):
             await event.reply(
-                "Your cloud configuration exists, but Drive access could not be "
-                "verified. Open /connect and reconnect Google Drive."
+                "Google Drive permissions have changed. Please disconnect and "
+                "reconnect Google Drive."
             )
             return
         file = getattr(event.message, "file", None)
