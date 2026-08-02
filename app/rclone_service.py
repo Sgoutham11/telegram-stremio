@@ -17,6 +17,11 @@ from .models import RcloneResult, UploadJob
 
 LOG = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, float, float | None], Awaitable[None]]
+GOOGLE_DRIVE_RCLONE_SCOPE = "drive.file"
+GOOGLE_DRIVE_RECONNECT_MESSAGE = (
+    "Google Drive permissions have changed. Please disconnect and reconnect "
+    "Google Drive."
+)
 
 
 def parse_rclone_progress(line: str) -> tuple[int, float, float | None] | None:
@@ -89,12 +94,36 @@ class RcloneService:
             raise ValueError("Storage remote does not exist in your rclone configuration")
         return selected
 
+    def uses_required_google_drive_scope(self, user_id: int, remote: str) -> bool:
+        """Return whether a configured Drive remote uses the app-file scope."""
+        config = self.config_path(user_id)
+        parser = configparser.RawConfigParser(interpolation=None)
+        try:
+            with config.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+            return (
+                parser.get(remote, "type").strip() == "drive"
+                and parser.get(remote, "scope", fallback="").strip()
+                == GOOGLE_DRIVE_RCLONE_SCOPE
+            )
+        except (configparser.Error, OSError):
+            return False
+
     async def verify_connection(
         self, user_id: int, remote: str, timeout_seconds: float = 30
     ) -> bool:
         """Verify that the user's remote is both configured and accessible."""
         async def check() -> tuple[int, str, str, str]:
             selected = await self.validate_remote(user_id, remote)
+            if not self.uses_required_google_drive_scope(user_id, selected):
+                LOG.warning(
+                    "%s User %s remote %s does not use scope %s.",
+                    GOOGLE_DRIVE_RECONNECT_MESSAGE,
+                    user_id,
+                    selected,
+                    GOOGLE_DRIVE_RCLONE_SCOPE,
+                )
+                return 1, "", GOOGLE_DRIVE_RECONNECT_MESSAGE, selected
             code, output, error = await self._run(
                 "rclone",
                 "lsd",
@@ -190,6 +219,8 @@ class RcloneService:
             "create",
             remote,
             "drive",
+            "scope",
+            GOOGLE_DRIVE_RCLONE_SCOPE,
             "client_id",
             client_id,
             "client_secret",

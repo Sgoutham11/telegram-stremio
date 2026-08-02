@@ -47,7 +47,9 @@ async def test_ls_is_permission_aware(settings, database):
     await bot._handle_command(regular_event, regular, "/ls")
 
     assert "/db users" in admin_event.replies[0]
+    assert "/block <user-id>" in admin_event.replies[0]
     assert "Administrator commands" not in regular_event.replies[0]
+    assert "/clear -" in regular_event.replies[0]
     assert "/dirroot" in regular_event.replies[0]
 
 

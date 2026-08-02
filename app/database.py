@@ -280,7 +280,6 @@ class Database:
                     users.selected_root_directory,
                     excluded.selected_root_directory
                 ),
-                active=1,
                 updated_at=excluded.updated_at
             """,
             (
@@ -467,6 +466,75 @@ class Database:
             f"UPDATE users SET {columns} WHERE telegram_user_id=?",
             (*fields.values(), user_id),
         )
+
+    async def clear_user_access(
+        self,
+        user_id: int,
+        default_directory: str,
+        active: bool | None = None,
+    ) -> bool:
+        """Remove connection state while retaining the user and job history."""
+        async with self._write_lock:
+            await self._db().execute("BEGIN IMMEDIATE")
+            cursor = await self._db().execute(
+                "SELECT 1 FROM users WHERE telegram_user_id=?", (user_id,)
+            )
+            if not await cursor.fetchone():
+                await self._db().rollback()
+                return False
+            await self._db().execute(
+                """
+                UPDATE upload_jobs
+                SET status=?, updated_at=?
+                WHERE owner_user_id=? AND status IN (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    JobStatus.CANCELLED.value,
+                    utcnow_text(),
+                    user_id,
+                    JobStatus.RECEIVED.value,
+                    JobStatus.FORWARDING.value,
+                    JobStatus.QUEUED.value,
+                    JobStatus.DOWNLOADING.value,
+                    JobStatus.DOWNLOADED.value,
+                    JobStatus.UPLOADING.value,
+                ),
+            )
+            for table in (
+                "telegram_login_sessions",
+                "onboarding_tokens",
+                "web_sessions",
+                "oauth_states",
+                "storage_connections",
+            ):
+                await self._db().execute(
+                    f"DELETE FROM {table} WHERE telegram_user_id=?", (user_id,)
+                )
+            await self._db().execute(
+                """
+                UPDATE users
+                SET telegram_connected=0,
+                    storage_connected=0,
+                    active=CASE WHEN ? IS NULL THEN active ELSE ? END,
+                    session_path=NULL,
+                    rclone_config_path=NULL,
+                    selected_remote=NULL,
+                    selected_root_directory=NULL,
+                    selected_directory=?,
+                    last_connected_at=NULL,
+                    updated_at=?
+                WHERE telegram_user_id=?
+                """,
+                (
+                    active,
+                    int(active) if active is not None else None,
+                    default_directory,
+                    utcnow_text(),
+                    user_id,
+                ),
+            )
+            await self._db().commit()
+            return True
 
     async def create_job(self, job: UploadJob) -> UploadJob:
         job_id = await self.execute(

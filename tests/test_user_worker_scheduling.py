@@ -155,6 +155,45 @@ async def test_third_user_submission_reports_busy_workers(settings, database):
     assert await database.user_worker_queue_position(30) == 3
 
 
+async def test_dispatcher_cancel_all_cancels_every_nonterminal_user_job(
+    settings, database
+):
+    await database.upsert_user(telegram_user(1), 1)
+    await database.upsert_user(telegram_user(2), 2)
+    first = await create_queued_job(
+        database, 1, 1, "first.bin", datetime.now(timezone.utc)
+    )
+    second = await create_queued_job(
+        database, 1, 2, "second.bin", datetime.now(timezone.utc)
+    )
+    other = await create_queued_job(
+        database, 2, 3, "other.bin", datetime.now(timezone.utc)
+    )
+
+    class Rclone:
+        def __init__(self):
+            self.cancelled = []
+
+        async def cancel(self, job_id):
+            self.cancelled.append(job_id)
+
+    rclone = Rclone()
+    dispatcher = JobDispatcher(
+        settings,
+        database,
+        SimpleNamespace(),
+        rclone,
+        SimpleNamespace(),
+        bot_user_id=500,
+    )
+
+    assert await dispatcher.cancel_all(1) == 2
+    assert (await database.get_job(first.id)).status == JobStatus.CANCELLED
+    assert (await database.get_job(second.id)).status == JobStatus.CANCELLED
+    assert (await database.get_job(other.id)).status == JobStatus.QUEUED
+    assert rclone.cancelled == [first.id, second.id]
+
+
 async def test_dispatcher_assigns_at_most_one_worker_per_user(settings, database):
     settings.max_concurrent_user_workers = 2
     settings.queue_poll_interval_seconds = 0.01

@@ -90,6 +90,22 @@ async def test_corrupt_user_does_not_block_other_users(settings, database):
     assert manager.get_client(20) is not None
 
 
+async def test_unauthorized_session_is_marked_for_reconnection(settings, database):
+    await connected_user(database, settings, 10)
+
+    class UnauthorizedClient(FakeClient):
+        async def is_user_authorized(self):
+            return False
+
+    manager = TelegramClientManager(settings, database, UnauthorizedClient)
+    await manager.start_all_users()
+
+    user = await database.get_user(10)
+    assert user["telegram_connected"] == 0
+    assert user["session_path"] is None
+    assert settings.user_session_path(10).exists()
+
+
 async def test_shutdown_disconnects_all(settings, database):
     for user_id in (10, 20):
         await connected_user(database, settings, user_id)

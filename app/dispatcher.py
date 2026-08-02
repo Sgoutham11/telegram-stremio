@@ -94,6 +94,35 @@ class JobDispatcher:
             return True
         return False
 
+    async def cancel_all(self, user_id: int) -> int:
+        rows = await self.database.fetchall(
+            """
+            SELECT id FROM upload_jobs
+            WHERE owner_user_id=? AND status IN (?, ?, ?, ?, ?, ?)
+            ORDER BY created_at, id
+            """,
+            (
+                user_id,
+                JobStatus.RECEIVED.value,
+                JobStatus.FORWARDING.value,
+                JobStatus.QUEUED.value,
+                JobStatus.DOWNLOADING.value,
+                JobStatus.DOWNLOADED.value,
+                JobStatus.UPLOADING.value,
+            ),
+        )
+        tasks = [
+            self._jobs[int(row["id"])]
+            for row in rows
+            if int(row["id"]) in self._jobs
+        ]
+        cancelled = 0
+        for row in rows:
+            cancelled += int(await self.cancel(user_id, int(row["id"])))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return cancelled
+
     async def _loop(self) -> None:
         while self._running:
             try:

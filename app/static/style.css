@@ -323,8 +323,12 @@ code {
   min-height: 1.5em;
   margin: -16px auto 18px;
   text-align: center;
-  color: var(--danger);
+  color: var(--blue);
   font-size: 0.9rem;
+}
+
+.notice.error {
+  color: #ff4d5e;
 }
 
 .notice:empty {

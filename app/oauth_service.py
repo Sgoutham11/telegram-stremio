@@ -11,7 +11,10 @@ import httpx
 from .config import Settings
 from .database import Database
 from .models import utcnow_text
-from .rclone_service import RcloneService
+from .rclone_service import (
+    GOOGLE_DRIVE_RECONNECT_MESSAGE,
+    RcloneService,
+)
 from .security import expires_at, random_token, token_hash
 
 
@@ -26,7 +29,11 @@ class GoogleOAuthService:
     TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
     REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke"
     USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
-    SCOPES = ("openid", "email", "https://www.googleapis.com/auth/drive")
+    SCOPES = (
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/drive.file",
+    )
 
     def __init__(
         self, settings: Settings, database: Database, rclone: RcloneService
@@ -48,6 +55,7 @@ class GoogleOAuthService:
         ):
             raise RuntimeError("Google OAuth is not configured")
         connections = await self._google_connections(user_id)
+        self._require_current_drive_permissions(user_id, connections)
         if len(connections) >= self.settings.multy_rclone_count:
             raise StorageConnectionError(
                 "limit",
@@ -76,7 +84,7 @@ class GoogleOAuthService:
                 "response_type": "code",
                 "scope": " ".join(self.SCOPES),
                 "access_type": "offline",
-                "include_granted_scopes": "true",
+                "include_granted_scopes": "false",
                 "prompt": "select_account consent",
                 "state": state,
             }
@@ -109,6 +117,7 @@ class GoogleOAuthService:
             )
         async with self._user_locks[user_id]:
             connections = await self._google_connections(user_id)
+            self._require_current_drive_permissions(user_id, connections)
             if any(
                 row["provider"] == "google"
                 and (
@@ -252,3 +261,16 @@ class GoogleOAuthService:
                 if row["provider"] == "google"
             ]
         return connections
+
+    def _require_current_drive_permissions(
+        self, user_id: int, connections: list[dict[str, Any]]
+    ) -> None:
+        if any(
+            not self.rclone.uses_required_google_drive_scope(
+                user_id, str(connection["remote_name"])
+            )
+            for connection in connections
+        ):
+            raise StorageConnectionError(
+                "permissions", GOOGLE_DRIVE_RECONNECT_MESSAGE
+            )

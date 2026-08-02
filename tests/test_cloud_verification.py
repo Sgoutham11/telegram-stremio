@@ -6,8 +6,9 @@ from types import SimpleNamespace
 
 import httpx
 
+from app.models import UploadJob
 from app.oauth_service import GoogleOAuthService
-from app.rclone_service import RcloneService
+from app.rclone_service import GOOGLE_DRIVE_RCLONE_SCOPE, RcloneService
 from app.security import RateLimiter, expires_at, random_token, token_hash
 from app.web import create_web_app
 from conftest import telegram_user
@@ -17,7 +18,9 @@ async def test_rclone_connection_requires_live_remote_access(settings):
     service = RcloneService(settings)
     config = settings.user_rclone_config(10)
     config.parent.mkdir(parents=True)
-    config.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+    config.write_text(
+        "[gdrive]\ntype = drive\nscope = drive.file\n", encoding="utf-8"
+    )
     calls = []
 
     async def run(*args):
@@ -36,7 +39,9 @@ async def test_rclone_connection_rejects_authentication_failure(settings):
     service = RcloneService(settings)
     config = settings.user_rclone_config(10)
     config.parent.mkdir(parents=True)
-    config.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+    config.write_text(
+        "[gdrive]\ntype = drive\nscope = drive.file\n", encoding="utf-8"
+    )
 
     async def run(*args):
         if args[1] == "listremotes":
@@ -51,7 +56,9 @@ async def test_rclone_connection_timeout_is_not_connected(settings):
     service = RcloneService(settings)
     config = settings.user_rclone_config(10)
     config.parent.mkdir(parents=True)
-    config.write_text("[gdrive]\ntype = drive\n", encoding="utf-8")
+    config.write_text(
+        "[gdrive]\ntype = drive\nscope = drive.file\n", encoding="utf-8"
+    )
 
     async def run(*_args):
         await asyncio.sleep(0.05)
@@ -68,7 +75,8 @@ async def test_rclone_recovers_google_identity_from_existing_drive(
     config = settings.user_rclone_config(10)
     config.parent.mkdir(parents=True)
     config.write_text(
-        '[gdrive]\ntype = drive\ntoken = {"access_token":"existing-token"}\n',
+        '[gdrive]\ntype = drive\nscope = drive.file\n'
+        'token = {"access_token":"existing-token"}\n',
         encoding="utf-8",
     )
 
@@ -108,6 +116,75 @@ async def test_rclone_recovers_google_identity_from_existing_drive(
         "drive-account-id",
         "existing@gmail.com",
     )
+
+
+async def test_legacy_full_drive_scope_requires_reconnect_without_drive_call(settings):
+    service = RcloneService(settings)
+    config = settings.user_rclone_config(10)
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "[gdrive]\ntype = drive\n"
+        "scope = https://www.googleapis.com/auth/drive\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    async def run(*args):
+        calls.append(args)
+        return 0, "gdrive:\n", ""
+
+    service._run = run
+
+    assert not await service.verify_connection(10, "gdrive")
+    assert [args[1] for args in calls] == ["listremotes"]
+
+
+async def test_rclone_create_uses_drive_file_scope(settings):
+    service = RcloneService(settings)
+    created = False
+    calls = []
+
+    async def run(*args):
+        nonlocal created
+        calls.append(args)
+        if args[1] == "listremotes":
+            return 0, "gdrive:\n" if created else "", ""
+        if args[1:4] == ("config", "create", "gdrive"):
+            created = True
+            service.config_path(10).write_text(
+                "[gdrive]\ntype = drive\nscope = drive.file\n",
+                encoding="utf-8",
+            )
+        return 0, "", ""
+
+    service._run = run
+    await service.create_google_drive(
+        10,
+        "gdrive",
+        "client-id",
+        "client-secret",
+        {"access_token": "token"},
+    )
+
+    create = next(args for args in calls if args[1:3] == ("config", "create"))
+    scope_index = create.index("scope")
+    assert create[scope_index + 1] == GOOGLE_DRIVE_RCLONE_SCOPE
+    assert "https://www.googleapis.com/auth/drive" not in create
+
+
+def test_drive_scope_change_does_not_change_destination_path(settings):
+    service = RcloneService(settings)
+    job = UploadJob(
+        owner_user_id=10,
+        bot_chat_id=20,
+        bot_message_id=30,
+        file_name="episode.mkv",
+        selected_remote="gdrive",
+        selected_root_directory="GOUTHAM",
+        selected_directory="SERIES",
+    )
+
+    assert service.build_remote_path(job) == "gdrive:GOUTHAM/SERIES/episode.mkv"
 
 
 async def test_starting_oauth_does_not_mark_storage_connected(settings, database):
